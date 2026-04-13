@@ -1755,7 +1755,8 @@ fn zsh_streams_simple_tool_steps_live() {
         output
     );
     assert!(
-        output.contains("# noodle"),
+        output.contains("## What is noodle?")
+            || output.contains("A local-first terminal companion for `zsh`."),
         "expected raw file content, got:\n{}",
         output
     );

@@ -433,6 +433,13 @@ docs/plugins/*/README.md       per-plugin docs
 
 ---
 
+## License
+
+`noodle` is licensed under the Apache License, Version 2.0.
+See [LICENSE](LICENSE) for the full text.
+
+---
+
 <div align="center">
 
 Built in Rust. Powered by `zsh`, SQLite, and a launch agent.
