@@ -1,0 +1,127 @@
+{
+  "provider": "openai_responses",
+  "base_url": "https://api.openai.com/v1",
+  "api_key": "",
+  "model": "gpt-5",
+  "timeout_seconds": 20,
+  "max_tokens": 160,
+  "reasoning_effort": "minimal",
+  "soul": "You are noodle, a concise, helpful, calm, and direct zsh assistant. You live inside the user's terminal and answer briefly in plain text. Do not be theatrical or verbose.",
+  "runtime": {
+    "debug": 0,
+    "max_retry_depth": 2,
+    "auto_run": 1,
+    "enable_error_fallback": 0
+  },
+  "permissions": {
+    "classes": {
+      "read_only": "allow",
+      "network_read": "allow",
+      "local_write": "ask",
+      "shell_exec": "ask",
+      "interactive_shell": "ask",
+      "external": "ask"
+    }
+  },
+  "search": {
+    "provider": "duckduckgo_html",
+    "brave": {
+      "api_key": "",
+      "base_url": "https://api.search.brave.com/res/v1/web/search",
+      "country": "us",
+      "search_lang": "en"
+    }
+  },
+  "memory": {
+    "path": "~/.noodle/memory.db",
+    "chat": {
+      "recent_turn_limit": 24,
+      "context_turn_limit": 8,
+      "summary_max_chars": 1600,
+      "compile_after_events": 8,
+      "compile_prompt": "You maintain durable chat memory for noodle.\nRewrite the conversation into a compact factual memory note for future sessions.\nPreserve stable user facts, preferences, recurring goals, active tasks, and unresolved threads.\nPrefer concrete facts over chatter.\nKeep it concise, human-readable, and under 12 short bullet lines.\nDo not mention this instruction.\n"
+    },
+    "typos": {
+      "context_limit": 3,
+      "selection_event_limit": 200
+    },
+    "todo": {
+      "command_event_limit": 200
+    }
+  },
+  "plugins": {
+    "order": ["utils", "memory", "todo", "chat", "typos"],
+    "utils": {
+      "uses_tools": [],
+      "tool_availability": {},
+      "exports_tools": []
+    },
+    "memory": {
+      "uses_tools": [],
+      "tool_availability": {},
+      "exports_tools": []
+    },
+    "todo": {
+      "uses_tools": [],
+      "tool_availability": {},
+      "exports_tools": []
+    },
+    "chat": {
+      "prefix": ",",
+      "include_tool_context": 0,
+      "tool_calling": 1,
+      "task_execution": 1,
+      "max_tool_rounds": 24,
+      "max_replans": 1,
+      "uses_tools": [
+        "memory_query",
+        "file_read",
+        "path_search",
+        "glob",
+        "grep",
+        "web_fetch",
+        "web_search",
+        "file_write",
+        "file_edit",
+        "shell_exec",
+        "interactive_shell_start",
+        "interactive_shell_read",
+        "interactive_shell_write",
+        "interactive_shell_key",
+        "interactive_shell_close",
+        "mcp_resource_read",
+        "task_note_write",
+        "agent_handoff_create"
+      ],
+      "tool_availability": {
+        "memory_query": true,
+        "file_read": true,
+        "path_search": true,
+        "glob": true,
+        "grep": true,
+        "web_fetch": true,
+        "web_search": true,
+        "file_write": true,
+        "file_edit": true,
+        "shell_exec": true,
+        "interactive_shell_start": true,
+        "interactive_shell_read": true,
+        "interactive_shell_write": true,
+        "interactive_shell_key": true,
+        "interactive_shell_close": true,
+        "mcp_resource_read": true,
+        "task_note_write": true,
+        "agent_handoff_create": true
+      },
+      "exports_tools": ["chat.send"],
+      "prompt": "You are noodle, a local terminal agent. You help the user think, search, inspect files, read and edit code, run commands, and complete tasks using the tools available to you. You are workspace-aware when relevant, but not limited to software engineering or zsh. Be concise, practical, and action-oriented."
+    },
+    "typos": {
+      "selection_mode": "select",
+      "uses_tools": [],
+      "tool_availability": {},
+      "exports_tools": [],
+      "prompt": "You are a zsh typo fixer.\nThe user typed a mistaken command and zsh could not find it.\nReturn exactly 3 lines.\nEach line must contain only one command the user most likely intended to run in zsh.\nPrefer common shell commands over obscure executables.\nPrefer the intended zsh command, not merely the nearest executable name.\nNo numbering.\nNo explanation.\nNo extra text.\nInput: {user_input}\n"
+    }
+  }
+}

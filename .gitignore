@@ -1,0 +1,14 @@
+.DS_Store
+
+# Rust build output
+/target/
+
+# Local install/test state
+/.install-test/
+/noodle-memory.db
+/dir
+
+# Local noodle runtime state
+/*.sock
+/*.pid
+/*.log
