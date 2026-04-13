@@ -1,150 +1,114 @@
-# noodle
+<div align="center">
 
-`noodle` is a macOS-first terminal companion for `zsh`.
+```
+███╗   ██╗ ██████╗  ██████╗ ██████╗ ██╗     ███████╗
+████╗  ██║██╔═══██╗██╔═══██╗██╔══██╗██║     ██╔════╝
+██╔██╗ ██║██║   ██║██║   ██║██║  ██║██║     █████╗
+██║╚██╗██║██║   ██║██║   ██║██║  ██║██║     ██╔══╝
+██║ ╚████║╚██████╔╝╚██████╔╝██████╔╝███████╗███████╗
+╚═╝  ╚═══╝ ╚═════╝  ╚═════╝ ╚═════╝ ╚══════╝╚══════╝
+```
 
-It combines:
+### A local-first terminal companion for `zsh`.
 
-- a thin `zsh` adapter
-- a local Rust daemon
-- a shared SQLite memory layer
-- a daemon-owned tool registry
-- a launchd-managed background service
+**Chat with your repo. Fix typos on the fly. Run an agentic assistant — without ever leaving your shell.**
 
-The shell adapter forwards events to the daemon. The daemon decides what to do, uses tools, stores memory, and streams actions back to the shell for rendering.
+![platform](https://img.shields.io/badge/platform-macOS-0a0a0a?style=flat-square)
+![shell](https://img.shields.io/badge/shell-zsh-4b5563?style=flat-square)
+![core](https://img.shields.io/badge/core-Rust-dea584?style=flat-square)
+![memory](https://img.shields.io/badge/memory-SQLite-003b57?style=flat-square)
+![mcp](https://img.shields.io/badge/protocol-MCP-6b46c1?style=flat-square)
 
-## Overview
+[Install](#install) · [Quick Start](#quick-start) · [Plugins](#plugins) · [Tools](#built-in-tools) · [Config](#configuration) · [MCP](#tasks--mcp)
 
-`noodle` ships with six daemon plugins:
+</div>
 
-- [utils](docs/plugins/utils/README.md) - deterministic slash commands for help, status, reload, and config inspection/editing
-- [memory](docs/plugins/memory/README.md) - deterministic inspection, search, and clearing of noodle's shared memory
-- [scripting](docs/plugins/scripting/README.md) - deterministic shell-scripting primitives such as shared KV storage with TTL
-- [todo](docs/plugins/todo/README.md) - a small terminal todo list stored in shared memory
-- [chat](docs/plugins/chat/README.md) - the main agentic assistant with tool use, planning, tasks, and interactive shell support
-- [typos](docs/plugins/typos/README.md) - typo recovery for `command not found` and optional command-error fallback
+---
 
-Each plugin has its own README with behavior, commands, and configuration.
+## What is noodle?
 
-## Plugin Guide
+`noodle` is a tiny shell adapter married to a local Rust daemon and a shared SQLite brain. It turns your terminal into a place where you can:
 
-The plugins are intentionally split by job. Some surfaces are deterministic and fast, some are model-assisted, and some are mostly there to make shell workflows less brittle.
+- **Talk to your repo.** `oo what changed in this repo?` — full tool use, planning, file edits, interactive shells.
+- **Recover from typos.** `git stauts` becomes `git status`, automatically or with a short menu.
+- **Script against shared state.** `/kv`, `/todo`, `/memory` — deterministic primitives that survive across shells.
+- **Plug into anything.** Ships as an MCP stdio server, so Claude, Cursor, and other MCP clients can call into it.
 
-### `utils`
+Everything runs on your machine. The daemon is a single Rust binary, launched by `launchd`, talking to your shell over a Unix socket.
 
-What it is:
-The control plane for noodle itself. It owns slash commands like `/help`, `/status`, `/reload`, and `/config ...`.
+## Why noodle?
 
-Why you would want it:
-Use `utils` when you need to inspect what noodle is doing, verify the active config, reload shell-side runtime state, or make config edits without opening JSON by hand.
+|                         |                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Local first**         | A single Rust binary. No Electron, no cloud state, no background Node process. Your memory stays on disk.   |
+| **Shell native**        | A thin `zsh` plugin — not a new terminal, not a wrapper. Works with your prompt, your aliases, your muscle memory. |
+| **Agentic when it counts** | Tool use, planning, permission gates, and resumable tasks — but only the `chat` plugin pays for it.       |
+| **Deterministic where it matters** | `/help`, `/status`, `/memory`, `/todo`, `/kv` are plain code paths. Fast, predictable, scriptable.   |
+| **MCP exposed**         | Every useful primitive surfaces through an MCP stdio server so other agents can drive noodle too.           |
+| **Small surface area**  | One binary, one socket, one SQLite file, one launch agent. Easy to reason about, easy to rip out.           |
 
-Typical commands:
-`/help`, `/status`, `/reload`, `/config get plugins.order`
+---
 
-### `memory`
+## Quick Start
 
-What it is:
-An operator view over noodle's shared SQLite memory. It summarizes usage, searches across stored state, and clears memory by plugin or globally.
+```sh
+# Chat with the agent
+oo what changed in this repo?
+, summarize the readme
 
-Why you would want it:
-Use `memory` when you want to understand what noodle has stored, debug odd behavior, inspect task/chat/todo residue, or wipe stale plugin state without deleting the whole DB.
+# Deterministic primitives
+/help
+/status
+/memory
+/kv set session-token abc123 --ttl 5m
+/todo add document the repo
+/todo list
 
-Typical commands:
-`/memory`, `/memory search deploy`, `/memory clear todo`
+# Direct CLI
+~/.noodle/bin/noodle tool-list --config ~/.noodle/config.json --plugin chat
+~/.noodle/bin/noodle task-list --config ~/.noodle/config.json
+~/.noodle/bin/noodle mcp
+```
 
-### `scripting`
+Two ways to invoke the agent:
 
-What it is:
-A deterministic shell-scripting bundle for small shared-state primitives. Right now it exposes `/kv` with optional TTL.
+- **`oo ...`** — the always-on entrypoint.
+- **`, ...`** — the configurable chat prefix (`NOODLE_CHAT_PREFIX`).
 
-Why you would want it:
-Use `scripting` from shell scripts, cron jobs, launchd jobs, or ad hoc terminal workflows when you need a tiny shared cache across shells without rolling your own temp files, lock files, or sqlite glue.
-
-Typical commands:
-`/kv set session-token abc123 --ttl 5m`, `/kv get session-token`, `/kv unset session-token`
-
-### `todo`
-
-What it is:
-A lightweight terminal todo list stored in noodle's shared memory with stable numeric ids and deterministic commands.
-
-Why you would want it:
-Use `todo` when you want a low-friction backlog right in the terminal, especially for short-lived work you do not want to push into a separate app or issue tracker.
-
-Typical commands:
-`/todo add document plugins`, `/todo list`, `/todo x 2`
-
-### `chat`
-
-What it is:
-The main agentic assistant behind `oo ...` and the configurable chat prefix. It can inspect the workspace, call tools, write files, run short plans, and drive interactive terminal sessions.
-
-Why you would want it:
-Use `chat` when the task is open-ended or multi-step: understanding a repo, editing code, gathering context, using built-in tools, or completing a task that benefits from planning and permission-aware execution.
-
-Typical entry points:
-`oo what changed in this repo?`, `, summarize this file`, MCP `chat.send`
-
-### `typos`
-
-What it is:
-The typo-recovery path for `command not found`, with optional handling for broader command failures when error fallback is enabled.
-
-Why you would want it:
-Use `typos` if you want the shell to recover from mistakes faster, either by showing likely intended commands or auto-running the top correction in a controlled way.
-
-Typical behavior:
-Turns a failed shell command into a short correction menu or an automatic retry, depending on `selection_mode` and `auto_run`.
-
-## How It Works
-
-The architecture is deliberately split:
-
-- `plugin/noodle.plugin.zsh`
-  Captures shell events and renders daemon actions
-- `src/main.rs`
-  Rust client, local commands, daemon server, provider calls, and memory orchestration
-- `src/tooling.rs`
-  Built-in tools, plugin manifests, slash-command registry, and permission classes
-- `src/executor.rs`
-  Tool loop, task execution, replanning, and permission resume
-- `src/context_builder.rs`
-  Prompt and tool-context assembly
-- `src/interactive_shell.rs`
-  PTY-backed interactive shell runtime
-
-The `zsh` layer is not the source of truth. The daemon owns:
-
-- plugin dispatch
-- tool definitions and invocation
-- MCP exposure
-- shared memory
-- task persistence
-- provider calls
-- permission decisions and resume state
+---
 
 ## Install
+
+One-liner:
 
 ```sh
 ./scripts/install.sh
 ```
 
-That script:
+The installer:
 
-- builds the Rust binary
-- installs files into `~/.noodle`
-- installs a launch agent at `~/Library/LaunchAgents/com.noodle.daemon.plist`
-- bootstraps and kickstarts the daemon with `launchctl`
-- on first install, prompts for provider/model/API-key details and writes them into `~/.noodle/config.json`
+1. Builds the Rust binary.
+2. Installs files into `~/.noodle`.
+3. Drops a launch agent at `~/Library/LaunchAgents/com.noodle.daemon.plist`.
+4. Bootstraps and kickstarts the daemon via `launchctl`.
+5. On first run, prompts for provider / model / API key and writes `~/.noodle/config.json`.
 
-If you rerun the installer in an interactive terminal, it can also update the configured model settings.
+Then add this to your `~/.zshrc`:
 
-To skip installer prompts entirely:
+```sh
+source "$HOME/.noodle/plugin/noodle.plugin.zsh"
+```
+
+<details>
+<summary><b>Non-interactive install</b></summary>
+
+Skip prompts entirely:
 
 ```sh
 NOODLE_INSTALL_CONFIGURE_LLM=0 ./scripts/install.sh
 ```
 
-To preseed installer values non-interactively:
+Preseed values:
 
 ```sh
 NOODLE_INSTALL_PROVIDER=openai_responses \
@@ -153,117 +117,172 @@ NOODLE_INSTALL_API_KEY=... \
 ./scripts/install.sh
 ```
 
-Then add this to `~/.zshrc`:
+Config lives at `~/.noodle/config.json`.
 
-```sh
-source "$HOME/.noodle/plugin/noodle.plugin.zsh"
+</details>
+
+---
+
+## How It Works
+
+Three pieces, one real host:
+
+```
+  ┌─────────────────┐        ┌──────────────────────┐        ┌──────────────┐
+  │  zsh adapter    │  unix  │   noodle daemon      │        │   SQLite     │
+  │  noodle.plugin  │◀──────▶│   (Rust, launchd)    │◀──────▶│  memory.db   │
+  │    .zsh         │ socket │   tools · plugins    │        │  events ·    │
+  └─────────────────┘        │   memory · permissions│       │  state ·     │
+           ▲                 └──────────┬───────────┘        │  artifacts   │
+           │                            │                    └──────────────┘
+      renders                           │ provider calls
+      actions                           ▼
+                                 ┌──────────────┐
+                                 │ OpenAI /     │
+                                 │ Anthropic /  │
+                                 │ OpenAI-compat│
+                                 └──────────────┘
 ```
 
-Config lives at:
+- **`plugin/noodle.plugin.zsh`** — captures shell events (`oo`, chat prefix, `command_not_found`, optional `command_error`) and renders streamed daemon actions: messages, runs, selections, permission requests, tool steps, session lifecycle, avatar animation.
+- **Rust daemon + client** — a single `noodle` binary that serves a Unix socket (`~/.noodle/noodle.sock`), runs the MCP stdio server, owns the tool registry, model provider calls, memory, and permission decisions.
+- **Shared SQLite memory** (`~/.noodle/memory.db`) — three layers: immutable `events`, derived `state`, and compiled `artifacts` (including task records).
 
-```text
-~/.noodle/config.json
-```
+The `zsh` layer is not the source of truth. The daemon owns plugin dispatch, tool definitions, MCP exposure, shared memory, task persistence, provider calls, and permission decisions.
 
-## Quick Start
+---
 
-Chat:
+## Plugins
+
+Six daemon plugins ship in the box. They split by job: some are deterministic and fast, some are model-assisted, some exist to make shell workflows less brittle.
+
+| Plugin      | What it is                                                                          | Try it                                           |
+| ----------- | ----------------------------------------------------------------------------------- | ------------------------------------------------ |
+| [`utils`](docs/plugins/utils/README.md)       | Control plane for noodle. `/help`, `/status`, `/reload`, `/config ...`.         | `/config get plugins.order`                      |
+| [`memory`](docs/plugins/memory/README.md)     | Operator view over shared SQLite memory. Summarize, search, clear by plugin.   | `/memory search deploy`                          |
+| [`scripting`](docs/plugins/scripting/README.md) | Small shell-scripting primitives. Shared KV with TTL.                        | `/kv set session-token abc123 --ttl 5m`          |
+| [`todo`](docs/plugins/todo/README.md)         | Terminal todo list with stable ids, stored in shared memory.                    | `/todo add document plugins`                     |
+| [`chat`](docs/plugins/chat/README.md)         | The agent behind `oo` and the chat prefix. Tool use, planning, tasks, shells.   | `oo what changed in this repo?`                  |
+| [`typos`](docs/plugins/typos/README.md)       | Typo recovery for `command not found` and optional command-error fallback.      | `git stauts` → `git status`                      |
+
+Each plugin has its own README with behavior, commands, and config.
+
+---
+
+## Built-in Tools
+
+Tools are **daemon primitives**, not plugin-owned behavior. Plugins opt in via `uses_tools` / `exports_tools`; the daemon owns schemas, permissions, invocation, and MCP exposure.
+
+| Tier                    | Tools                                                                                                                                      | Default policy        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------- |
+| **Tier 1 — read**       | `memory_query` · `file_read` · `path_search` · `glob` · `grep` · `web_fetch` · `web_search`                                                | `allow`               |
+| **Tier 2 — write / exec** | `file_write` · `file_edit` · `shell_exec` · `interactive_shell_{start,read,write,key,close}`                                             | `ask`                 |
+| **Tier 3 — orchestration** | `mcp_resource_read` · `task_note_write` · `agent_handoff_create`                                                                        | `ask`                 |
+
+Permissions are overridable per-class or per-tool under `permissions.classes` / `permissions.tools` in config.
+
+`web_search` defaults to `duckduckgo_html` and can switch to Brave Search API.
+
+---
+
+## Slash Commands
+
+<details>
+<summary><b>All built-in slash commands</b></summary>
+
+**Core**
+- `/help`
+- `/status`
+- `/reload`
+
+**Config**
+- `/config help`
+- `/config show [key]`
+- `/config get <key>`
+- `/config set <key> <value>`
+- `/config unset <key>`
+
+**Memory**
+- `/memory`
+- `/memory help`
+- `/memory search <term>`
+- `/memory clear <plugin|all>`
+
+**Todo**
+- `/todo list`
+- `/todo help`
+- `/todo add <task>`
+- `/todo / <id>` · `/todo x <id>` · `/todo done <id>`
+- `/todo reopen <id>`
+- `/todo remove <id>` · `/todo rm <id>`
+- `/todo show <id>`
+- `/todo clear-done`
+
+**Scripting**
+- `/kv set <key> <value> [--ttl <dur>]`
+- `/kv get <key>`
+- `/kv unset <key>`
+
+</details>
+
+---
+
+## Tasks & MCP
+
+Planned work is persisted as **task records** in shared memory. Tasks are resumable: if a step requires permission, the daemon suspends, streams a `permission_request`, and later resumes the exact pending step.
 
 ```sh
-oo what changed in this repo?
-, summarize the readme
+~/.noodle/bin/noodle task-list   --config ~/.noodle/config.json
+~/.noodle/bin/noodle task-show   --config ~/.noodle/config.json --task-id <id>
+~/.noodle/bin/noodle task-resume --config ~/.noodle/config.json --task-id <id>
+~/.noodle/bin/noodle task-cancel --config ~/.noodle/config.json --task-id <id>
 ```
 
-Deterministic slash commands:
+noodle also exposes an **MCP stdio server**:
 
 ```sh
-/help
-/status
-/reload
-/memory
-/kv set session-token abc123 --ttl 5m
-/todo add document the repo
-/todo list
-```
-
-Direct CLI utilities:
-
-```sh
-~/.noodle/bin/noodle tool-list --config ~/.noodle/config.json --plugin chat
-~/.noodle/bin/noodle task-list --config ~/.noodle/config.json
 ~/.noodle/bin/noodle mcp
 ```
 
-## Built-In Tools
+Today the main exported MCP tool is `chat.send`, owned by the `chat` plugin — so any MCP client can drive the full agent.
 
-The daemon exposes built-in primitives, not plugin-owned tools.
+---
 
-Tier 1:
+## Configuration
 
-- `memory_query`
-- `file_read`
-- `path_search`
-- `glob`
-- `grep`
-- `web_fetch`
-- `web_search`
+The canonical example lives at [`config/config.example.json`](config/config.example.json). Every setting can be overridden with a `NOODLE_*` env var.
 
-Tier 2:
+<details>
+<summary><b>Top-level settings</b></summary>
 
-- `file_write`
-- `file_edit`
-- `shell_exec`
-- `interactive_shell_start`
-- `interactive_shell_read`
-- `interactive_shell_write`
-- `interactive_shell_key`
-- `interactive_shell_close`
+| Key                    | Meaning                                                                     |
+| ---------------------- | --------------------------------------------------------------------------- |
+| `provider`             | `openai_responses` · `openai_compatible` · `anthropic` · `stub`             |
+| `base_url`             | Provider base URL                                                           |
+| `api_key`              | Provider API key                                                            |
+| `model`                | Model name                                                                  |
+| `max_tokens`           | Max model output tokens                                                     |
+| `reasoning_effort`     | Reasoning level for providers that support it                               |
+| `timeout_seconds`      | HTTP timeout (default `20`)                                                 |
+| `soul`                 | High-level assistant identity block included in prompts                     |
+| `debug`                | Legacy; prefer `runtime.debug`                                              |
 
-Tier 3:
+</details>
 
-- `mcp_resource_read`
-- `task_note_write`
-- `agent_handoff_create`
+<details>
+<summary><b><code>runtime</code></b></summary>
 
-`web_search` uses `duckduckgo_html` by default and can optionally use Brave Search API.
+- `runtime.debug` — extra logging and debug paths
+- `runtime.auto_run` — auto-run inferred typo fixes vs. display only
+- `runtime.enable_error_fallback` — forward non-`127` failures into the typo/error flow
+- `runtime.max_retry_depth` — cap recursive retries
 
-## Configuration Reference
+</details>
 
-The canonical example file is [config/config.example.json](config/config.example.json).
+<details>
+<summary><b><code>permissions</code></b></summary>
 
-### Top-Level Settings
-
-- `provider`
-  Model backend. Supported values: `openai_responses`, `openai_compatible`, `anthropic`, `stub`
-- `base_url`
-  Provider base URL
-- `api_key`
-  Provider API key
-- `model`
-  Model name
-- `max_tokens`
-  Maximum model output tokens
-- `reasoning_effort`
-  Reasoning level for providers that support it
-- `timeout_seconds`
-  HTTP timeout for provider requests. Default is `20` if omitted
-- `soul`
-  High-level assistant identity block included in prompts
-- `debug`
-  Legacy compatibility key. Prefer `runtime.debug`
-
-### `runtime`
-
-- `runtime.debug`
-  Enables debug behavior and extra logging paths
-- `runtime.auto_run`
-  Controls whether inferred typo fixes auto-run or only display
-- `runtime.enable_error_fallback`
-  Enables forwarding non-`127` command failures into the typo/error flow
-- `runtime.max_retry_depth`
-  Prevents recursive command retry loops
-
-### `permissions`
+Classes:
 
 - `permissions.classes.read_only`
 - `permissions.classes.network_read`
@@ -272,213 +291,150 @@ The canonical example file is [config/config.example.json](config/config.example
 - `permissions.classes.interactive_shell`
 - `permissions.classes.external`
 
-Each class accepts:
+Each accepts `allow`, `ask`, or `deny`. Per-tool overrides go under `permissions.tools.<tool_name>`.
 
-- `allow`
-- `ask`
-- `deny`
+</details>
 
-Optional per-tool overrides live under:
+<details>
+<summary><b><code>search</code></b></summary>
 
-- `permissions.tools.<tool_name>`
-
-### `search`
-
-- `search.provider`
-  Search backend for `web_search`. Supported values: `duckduckgo_html`, `brave_api`
+- `search.provider` — `duckduckgo_html` or `brave_api`
 - `search.brave.api_key`
-  Brave Search API key
-- `search.brave.base_url`
-  Brave Search API endpoint. Default: `https://api.search.brave.com/res/v1/web/search`
-- `search.brave.country`
-  Brave query country code. Default: `us`
-- `search.brave.search_lang`
-  Brave query language. Default: `en`
+- `search.brave.base_url` — default `https://api.search.brave.com/res/v1/web/search`
+- `search.brave.country` — default `us`
+- `search.brave.search_lang` — default `en`
 
-### `memory`
+</details>
 
-- `memory.path`
-  SQLite database location
+<details>
+<summary><b><code>memory</code></b></summary>
 
-Plugin-specific memory settings are documented in the plugin READMEs:
+- `memory.path` — SQLite database location
+
+Plugin-specific memory settings live in the plugin READMEs:
 
 - [chat memory settings](docs/plugins/chat/README.md#memory-settings)
 - [todo memory settings](docs/plugins/todo/README.md#configuration)
 - [typos memory settings](docs/plugins/typos/README.md#memory-settings)
 
-### `plugins`
+</details>
 
-- `plugins.order`
-  Ordered list of enabled daemon plugins
+<details>
+<summary><b><code>plugins</code></b></summary>
+
+- `plugins.order` — ordered list of enabled daemon plugins
 
 Every plugin block may define:
 
-- `plugins.<plugin>.uses_tools`
-  Base allowlist of built-in tools for that plugin
-- `plugins.<plugin>.tool_availability`
-  Per-tool boolean override map layered on top of `uses_tools`
-- `plugins.<plugin>.exports_tools`
-  MCP-exposed tool names owned by that plugin
+- `plugins.<plugin>.uses_tools` — base allowlist of built-in tools
+- `plugins.<plugin>.tool_availability` — per-tool boolean override map
+- `plugins.<plugin>.exports_tools` — MCP-exposed tool names
 
-Plugin-specific settings are documented here:
+Per-plugin config:
 
-- [utils plugin config](docs/plugins/utils/README.md#configuration)
-- [memory plugin config](docs/plugins/memory/README.md#configuration)
-- [scripting plugin config](docs/plugins/scripting/README.md#configuration)
-- [todo plugin config](docs/plugins/todo/README.md#configuration)
-- [chat plugin config](docs/plugins/chat/README.md#configuration)
-- [typos plugin config](docs/plugins/typos/README.md#configuration)
+- [utils](docs/plugins/utils/README.md#configuration)
+- [memory](docs/plugins/memory/README.md#configuration)
+- [scripting](docs/plugins/scripting/README.md#configuration)
+- [todo](docs/plugins/todo/README.md#configuration)
+- [chat](docs/plugins/chat/README.md#configuration)
+- [typos](docs/plugins/typos/README.md#configuration)
 
-### `stub`
+</details>
 
-The `stub` provider is for tests and deterministic harnesses.
+<details>
+<summary><b><code>stub</code> provider (tests)</b></summary>
 
 - `stub.mode`
 - `stub.default_response`
 - `stub.matchers`
 
-This is primarily useful for local development and the e2e harness, not normal interactive use.
+Used by the e2e harness and local dev, not normal interactive use.
 
-## Environment Overrides
+</details>
 
-These environment variables are supported by the current runtime and adapter.
+### Environment overrides
 
-Provider and model:
+<details>
+<summary><b>Provider & model</b></summary>
 
-- `NOODLE_CONFIG`
-- `NOODLE_PROVIDER`
-- `NOODLE_BASE_URL`
-- `NOODLE_API_KEY`
-- `NOODLE_MODEL`
-- `NOODLE_REASONING_EFFORT`
-- `NOODLE_MAX_TOKENS`
-- `NOODLE_TIMEOUT_SECONDS`
+`NOODLE_CONFIG` · `NOODLE_PROVIDER` · `NOODLE_BASE_URL` · `NOODLE_API_KEY` · `NOODLE_MODEL` · `NOODLE_REASONING_EFFORT` · `NOODLE_MAX_TOKENS` · `NOODLE_TIMEOUT_SECONDS`
 
-Prompt and chat behavior:
+</details>
 
-- `NOODLE_CHAT_PREFIX`
-- `NOODLE_CHAT_INCLUDE_TOOL_CONTEXT`
-- `NOODLE_CHAT_PROMPT`
-- `NOODLE_PROMPT`
+<details>
+<summary><b>Prompt & chat behavior</b></summary>
 
-Runtime and shell behavior:
+`NOODLE_CHAT_PREFIX` · `NOODLE_CHAT_INCLUDE_TOOL_CONTEXT` · `NOODLE_CHAT_PROMPT` · `NOODLE_PROMPT`
 
-- `NOODLE_DEBUG`
-- `NOODLE_AUTO_RUN`
-- `NOODLE_ENABLE_ERROR_FALLBACK`
-- `NOODLE_MAX_RETRY_DEPTH`
-- `NOODLE_PLUGIN_ORDER`
-- `NOODLE_SELECTION_MODE`
+</details>
 
-Memory and search:
+<details>
+<summary><b>Runtime & shell behavior</b></summary>
 
-- `NOODLE_MEMORY_DB`
-- `NOODLE_SEARCH_PROVIDER`
-- `NOODLE_BRAVE_SEARCH_API_KEY`
-- `BRAVE_SEARCH_API_KEY`
-- `NOODLE_BRAVE_SEARCH_BASE_URL`
+`NOODLE_DEBUG` · `NOODLE_AUTO_RUN` · `NOODLE_ENABLE_ERROR_FALLBACK` · `NOODLE_MAX_RETRY_DEPTH` · `NOODLE_PLUGIN_ORDER` · `NOODLE_SELECTION_MODE`
 
-Adapter and daemon wiring:
+</details>
 
-- `NOODLE_HELPER`
-- `NOODLE_SOCKET`
-- `NOODLE_PIDFILE`
+<details>
+<summary><b>Memory & search</b></summary>
 
-Installer-only variables:
+`NOODLE_MEMORY_DB` · `NOODLE_SEARCH_PROVIDER` · `NOODLE_BRAVE_SEARCH_API_KEY` · `BRAVE_SEARCH_API_KEY` · `NOODLE_BRAVE_SEARCH_BASE_URL`
 
-- `NOODLE_INSTALL_CONFIGURE_LLM`
-- `NOODLE_INSTALL_PROVIDER`
-- `NOODLE_INSTALL_BASE_URL`
-- `NOODLE_INSTALL_API_KEY`
-- `NOODLE_INSTALL_MODEL`
-- `NOODLE_INSTALL_REASONING_EFFORT`
-- `NOODLE_INSTALL_TIMEOUT_SECONDS`
+</details>
 
-## Slash Commands
+<details>
+<summary><b>Adapter & daemon wiring</b></summary>
 
-Current built-in slash commands:
+`NOODLE_HELPER` · `NOODLE_SOCKET` · `NOODLE_PIDFILE`
 
-- `/help`
-- `/status`
-- `/reload`
-- `/config help`
-- `/config show`
-- `/config show <key>`
-- `/config get <key>`
-- `/config set <key> <value>`
-- `/config unset <key>`
-- `/memory`
-- `/memory help`
-- `/memory search <term>`
-- `/memory clear <plugin|all>`
-- `/todo list`
-- `/todo help`
-- `/todo add <task>`
-- `/todo / <id>`
-- `/todo x <id>`
-- `/todo done <id>`
-- `/todo reopen <id>`
-- `/todo remove <id>`
-- `/todo rm <id>`
-- `/todo show <id>`
-- `/todo clear-done`
+</details>
 
-## Tasks And MCP
+<details>
+<summary><b>Installer only</b></summary>
 
-Planned work is persisted as task records in shared memory.
+`NOODLE_INSTALL_CONFIGURE_LLM` · `NOODLE_INSTALL_PROVIDER` · `NOODLE_INSTALL_BASE_URL` · `NOODLE_INSTALL_API_KEY` · `NOODLE_INSTALL_MODEL` · `NOODLE_INSTALL_REASONING_EFFORT` · `NOODLE_INSTALL_TIMEOUT_SECONDS`
 
-Useful commands:
+</details>
 
-```sh
-~/.noodle/bin/noodle task-list --config ~/.noodle/config.json
-~/.noodle/bin/noodle task-show --config ~/.noodle/config.json --task-id <task-id>
-~/.noodle/bin/noodle task-resume --config ~/.noodle/config.json --task-id <task-id>
-~/.noodle/bin/noodle task-cancel --config ~/.noodle/config.json --task-id <task-id>
-```
-
-`noodle` also exposes an MCP stdio server:
-
-```sh
-~/.noodle/bin/noodle mcp
-```
-
-Today the main exported MCP tool is `chat.send`, owned by the `chat` plugin.
+---
 
 ## Testing
 
-End-to-end coverage:
+End-to-end coverage runs against a real sourced `zsh` adapter, the Rust binary, and a stub provider — no network, deterministic output:
 
 ```sh
-./scripts/test-e2e.sh
+./scripts/test-e2e.sh        # cargo test --test e2e
+./scripts/test-tools.sh      # builtin tool coverage harness
 ```
 
-Builtin tool harness:
+`NOODLE_BYPASS_DAEMON=1` routes requests through the local executor instead of the socket, used by tests and offline tool calls.
 
-```sh
-./scripts/test-tools.sh
-```
-
-The harness uses the built-in stub provider plus local bypass mode so development stays deterministic and fast.
+---
 
 ## Repository Layout
 
-- `plugin/noodle.plugin.zsh`
-  `zsh` adapter
-- `src/main.rs`
-  CLI entrypoint, daemon, provider calls, and memory orchestration
-- `src/tooling.rs`
-  Tool registry, plugin manifests, slash-command registry, permissions
-- `src/executor.rs`
-  Tool loop, tasks, replanning, interactive progress
-- `src/interactive_shell.rs`
-  PTY-backed interactive shell runtime
-- `src/memory_commands.rs`
-  Deterministic `/memory ...` handler
-- `src/todo.rs`
-  Deterministic `/todo ...` handler
-- `src/utils.rs`
-  Deterministic `/help`, `/status`, `/reload`, `/config ...` handler
-- `config/config.example.json`
-  Example configuration
-- `docs/plugins/*/README.md`
-  Per-plugin docs for GitHub distribution
+```
+plugin/noodle.plugin.zsh       zsh adapter — events in, actions out
+src/main.rs                    CLI, daemon server, provider calls, memory
+src/tooling.rs                 tool registry, manifests, permissions
+src/executor.rs                tool loop, tasks, replanning, permission resume
+src/interactive_shell.rs       PTY-backed interactive shell runtime
+src/context_builder.rs         prompt and tool-context assembly
+src/planner.rs                 planning directives and task-plan parsing
+src/tasks.rs                   durable task records and resumable runtime state
+src/actions.rs                 DaemonAction enum streamed back to the adapter
+src/permissions.rs             permission class resolution
+src/memory_commands.rs         deterministic /memory handler
+src/todo.rs                    deterministic /todo handler
+src/utils.rs                   deterministic /help /status /reload /config
+config/config.example.json     example configuration
+docs/plugins/*/README.md       per-plugin docs
+```
+
+---
+
+<div align="center">
+
+Built in Rust. Powered by `zsh`, SQLite, and a launch agent.
+
+</div>
