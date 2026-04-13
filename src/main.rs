@@ -6,6 +6,7 @@ mod interactive_shell;
 mod memory_commands;
 mod permissions;
 mod planner;
+mod scripting;
 mod tasks;
 mod todo;
 mod tooling;
@@ -13,6 +14,7 @@ mod utils;
 
 use crate::context_builder::{EventPromptInput, build_chat_base_prompt, build_event_prompt};
 use crate::memory_commands::handle_memory_command;
+use crate::scripting::handle_scripting_command;
 use crate::tasks::{cancel_task, list_task_records, load_task_record, load_task_runtime_state};
 use crate::todo::handle_todo_command;
 use crate::utils::handle_utils_command;
@@ -21,13 +23,14 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 use tooling::{
     ToolDefinition, enabled_plugin_manifests, exported_mcp_tools, invoke_builtin_tool,
     plugin_matches_request, registered_slash_command_names, tools_for_plugin,
@@ -35,6 +38,12 @@ use tooling::{
 
 const DEFAULT_TYPOS_PROMPT: &str = "You are a zsh typo fixer.\nThe user typed a mistaken command and zsh could not find it.\nReturn exactly 3 lines.\nEach line must contain only one command the user most likely intended to run in zsh.\nPrefer common shell commands over obscure executables.\nPrefer the intended zsh command, not merely the nearest executable name.\nNo numbering.\nNo explanation.\nNo extra text.\nInput: {user_input}\n";
 const DEFAULT_CHAT_PROMPT: &str = "You are noodle, a local terminal agent. You help the user think, search, inspect files, read and edit code, run commands, and complete tasks using the tools available to you. You are workspace-aware when relevant, but not limited to software engineering or zsh. Be concise, practical, and action-oriented.";
+
+#[derive(Clone)]
+struct CachedConfig {
+    modified: Option<SystemTime>,
+    value: Value,
+}
 
 fn noodle_soul_block(config: &Value) -> String {
     match lookup(config, "soul") {
@@ -324,8 +333,8 @@ fn execute_streaming(command: Command) -> Result<(), String> {
 
     let socket = default_socket_path();
     let request = to_request(command);
-    let mut stream =
-        open_stream_request(&socket, &request).map_err(|err| daemon_unavailable_error(&socket, &err))?;
+    let mut stream = open_stream_request(&socket, &request)
+        .map_err(|err| daemon_unavailable_error(&socket, &err))?;
     let mut reader = io::BufReader::new(&mut stream);
     let mut line = String::new();
     loop {
@@ -1094,7 +1103,8 @@ fn execute_local(command: Command) -> Result<String, String> {
         }
         Command::ToolBatch { config, calls_json } => {
             let config = load_config(&config);
-            let calls = serde_json::from_str::<Value>(&calls_json).map_err(|err| err.to_string())?;
+            let calls =
+                serde_json::from_str::<Value>(&calls_json).map_err(|err| err.to_string())?;
             let items = calls
                 .as_array()
                 .ok_or_else(|| "tool-batch requires a JSON array".to_string())?;
@@ -1140,13 +1150,10 @@ fn execute_local(command: Command) -> Result<String, String> {
             let debug = value_or_env(&config, "NOODLE_DEBUG", "runtime.debug", "0") != "0"
                 || value_or_env(&config, "NOODLE_DEBUG", "debug", "0") != "0";
             let mut noop = |_action: &actions::DaemonAction| Ok(());
-            let payload = engine::resume_task_execution(
-                &config,
-                &task_id,
-                false,
-                &mut noop,
-                &|prompt| model_output(&config, prompt, debug),
-            )?;
+            let payload =
+                engine::resume_task_execution(&config, &task_id, false, &mut noop, &|prompt| {
+                    model_output(&config, prompt, debug)
+                })?;
             serde_json::to_string(&payload.into_value()).map_err(|err| err.to_string())
         }
         Command::TaskCancel { config, task_id } => {
@@ -1242,7 +1249,8 @@ fn resolve_batch_args(value: &Value, previous_results: &[Value]) -> Value {
             }
         }
         Value::Array(items) => Value::Array(
-            items.iter()
+            items
+                .iter()
                 .map(|item| resolve_batch_args(item, previous_results))
                 .collect(),
         ),
@@ -1268,15 +1276,44 @@ fn resolve_batch_reference(text: &str, previous_results: &[Value]) -> Option<Val
 
 fn load_config(path: &str) -> Value {
     let expanded = expand_home(path);
-    let mut value = fs::read_to_string(&expanded)
+    let modified = fs::metadata(&expanded)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    if let Ok(cache) = config_cache().lock() {
+        if let Some(cached) = cache.get(&expanded) {
+            if cached.modified == modified {
+                return config_with_meta(cached.value.clone(), &expanded);
+            }
+        }
+    }
+
+    let value = fs::read_to_string(&expanded)
         .ok()
         .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         .unwrap_or_else(|| json!({}));
+    if let Ok(mut cache) = config_cache().lock() {
+        cache.insert(
+            expanded.clone(),
+            CachedConfig {
+                modified,
+                value: value.clone(),
+            },
+        );
+    }
+    config_with_meta(value, &expanded)
+}
+
+fn config_cache() -> &'static Mutex<HashMap<PathBuf, CachedConfig>> {
+    static CONFIG_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedConfig>>> = OnceLock::new();
+    CONFIG_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn config_with_meta(mut value: Value, path: &Path) -> Value {
     if let Some(object) = value.as_object_mut() {
         object.insert(
             "_meta".into(),
             json!({
-                "config_path": expanded.to_string_lossy().to_string()
+                "config_path": path.to_string_lossy().to_string()
             }),
         );
     }
@@ -1935,6 +1972,10 @@ fn dispatch_event(
                 debug_log(debug, "matched_plugin", "memory");
                 return handle_memory_command(config, input);
             }
+            "scripting" => {
+                debug_log(debug, "matched_plugin", "scripting");
+                return handle_scripting_command(config, input);
+            }
             "todo" => {
                 debug_log(debug, "matched_plugin", "todo");
                 return handle_todo_command(config, input);
@@ -1985,7 +2026,13 @@ fn dispatch_event_streaming(
         return handle_typo_selected(config, input, selected_command);
     }
     if event == "permission_response" {
-        return handle_permission_response_streaming(config, input, selected_command, debug, emitter);
+        return handle_permission_response_streaming(
+            config,
+            input,
+            selected_command,
+            debug,
+            emitter,
+        );
     }
     let manifests = enabled_plugin_manifests(config);
     for manifest in manifests {
@@ -1998,6 +2045,9 @@ fn dispatch_event_streaming(
             }
             "memory" => {
                 return handle_memory_command(config, input);
+            }
+            "scripting" => {
+                return handle_scripting_command(config, input);
             }
             "todo" => {
                 return handle_todo_command(config, input);
@@ -2188,13 +2238,9 @@ fn handle_agentic_plugin(
         available_tools: engine::plugin_tools_for_config(config, plugin_name),
     };
     let mut noop = |_action: &actions::DaemonAction| Ok(());
-    let action = engine::run_chat_execution(
-        config,
-        request,
-        false,
-        &mut noop,
-        &|prompt| model_output(config, prompt, debug),
-    )?;
+    let action = engine::run_chat_execution(config, request, false, &mut noop, &|prompt| {
+        model_output(config, prompt, debug)
+    })?;
     let message = action.primary_text().unwrap_or_default();
     memory_append_event(
         config,
@@ -2252,13 +2298,9 @@ fn handle_agentic_plugin_streaming(
         max_replans: engine::plugin_max_replans(config, plugin_name),
         available_tools: engine::plugin_tools_for_config(config, plugin_name),
     };
-    let action = engine::run_chat_execution(
-        config,
-        request,
-        true,
-        emitter,
-        &|prompt| model_output(config, prompt, debug),
-    )?;
+    let action = engine::run_chat_execution(config, request, true, emitter, &|prompt| {
+        model_output(config, prompt, debug)
+    })?;
     let message = action.primary_text().unwrap_or_default();
     memory_append_event(
         config,
@@ -2826,7 +2868,7 @@ fn dedupe(items: Vec<String>) -> Vec<String> {
 fn render_runtime_config(config: &Value) -> String {
     let slash_commands = registered_slash_command_names(config).join(" ");
     format!(
-        "debug={}\nauto_run={}\nenable_error_fallback={}\nmax_retry_depth={}\nplugin_order={}\nselection_mode={}\nslash_commands={}\n",
+        "debug={}\nauto_run={}\nenable_error_fallback={}\nmax_retry_depth={}\nplugin_order={}\nselection_mode={}\nslash_commands={}\nchat_prefix={}\n",
         value_or_env(config, "NOODLE_DEBUG", "runtime.debug", "0"),
         value_or_env(config, "NOODLE_AUTO_RUN", "runtime.auto_run", "1"),
         value_or_env(
@@ -2845,7 +2887,7 @@ fn render_runtime_config(config: &Value) -> String {
             config,
             "NOODLE_PLUGIN_ORDER",
             "plugins.order",
-            "utils memory todo chat typos",
+            "utils memory scripting todo chat typos",
         ),
         value_or_env(
             config,
@@ -2854,6 +2896,7 @@ fn render_runtime_config(config: &Value) -> String {
             "select",
         ),
         slash_commands,
+        value_or_env(config, "NOODLE_CHAT_PREFIX", "plugins.chat.prefix", ","),
     )
 }
 
@@ -2948,12 +2991,8 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "{}-{}-{}",
-                prefix,
-                std::process::id(),
-                nanos
-            ));
+            let path =
+                std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nanos));
             fs::create_dir_all(&path).unwrap();
             Self { path }
         }

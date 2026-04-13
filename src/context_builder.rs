@@ -36,6 +36,10 @@ pub enum TaskDirectiveContext {
     },
     VerifyDirectAnswer {
         draft_answer: String,
+        required_tool_use_reason: Option<String>,
+    },
+    ForceToolChoice {
+        reason: String,
     },
     Replan {
         summary: String,
@@ -187,6 +191,9 @@ Rules:\n\
 - Choose the tool whose purpose and input schema best match the current request or current task step.\n\
 - A bare STEP is valid when you want to provide the next concrete action directly without a separate PLAN line.\n\
 - Prefer dedicated primitives like file_read, path_search, glob, grep, web_fetch, and web_search over shell_exec when they fit the task.\n\
+- For requests to create, save, overwrite, or otherwise write a local file, prefer file_write directly.\n\
+- For requests to modify existing text in a local file, prefer file_edit directly.\n\
+- Do not answer a local write request with prose about what you might do next. Choose the concrete write tool step instead.\n\
 - Use shell_exec only when no dedicated tool fits or when the task is specifically about running a command.\n\
 - Use interactive_shell_start plus interactive_shell_read and interactive_shell_write when the task requires driving an interactive command, REPL, installer, prompt, or TUI over multiple turns.\n\
 - Use interactive_shell_key when the next action is a real keypress such as Enter, Tab, Escape, arrow keys, or Ctrl+C.\n\
@@ -305,7 +312,11 @@ fn render_interactive_shell_read_turn(turn: &ToolTurnContext) -> String {
     let screen = limit_screen_text(screen_tail, 4000);
     let prompt_region = limit_screen_text(prompt_region, 2000);
     let menu_options = limit_screen_text(&menu_options, 800);
-    let screen_block = if screen.is_empty() { "<empty>" } else { &screen };
+    let screen_block = if screen.is_empty() {
+        "<empty>"
+    } else {
+        &screen
+    };
     let prompt_block = if prompt_region.is_empty() {
         "<none>"
     } else {
@@ -349,8 +360,12 @@ fn render_task_directive(directive: TaskDirectiveContext) -> String {
                 )
             }
         }
-        TaskDirectiveContext::VerifyDirectAnswer { draft_answer } => format!(
-            "You previously drafted a direct answer before using any tools.\n\
+        TaskDirectiveContext::VerifyDirectAnswer {
+            draft_answer,
+            required_tool_use_reason,
+        } => {
+            let mut directive = format!(
+                "You previously drafted a direct answer before using any tools.\n\
 Draft answer:\n{}\n\n\
 Treat that draft as unverified.\n\
 Decide whether it is safe to return without using tools.\n\
@@ -364,7 +379,28 @@ TOOL: <tool_name> <json arguments>\n\
 STEP: <tool_name> <json arguments>\n\
 PLAN: <short summary>\n\
 Do not answer the user directly in this pass.",
-            draft_answer
+                draft_answer
+            );
+            if let Some(reason) = required_tool_use_reason.filter(|value| !value.trim().is_empty())
+            {
+                directive.push_str(&format!(
+                    "\n- This request explicitly requires tool use before any final answer: {}",
+                    reason
+                ));
+                directive.push_str(
+                    "\n- Do not reply FINAL_OK for this request.\n- Do not reply with a meta statement about needing tools. Choose the next tool step now.",
+                );
+            }
+            directive
+        }
+        TaskDirectiveContext::ForceToolChoice { reason } => format!(
+            "You must choose a tool-based next action now.\nReason: {}\n\
+Reply with exactly one of:\n\
+TOOL: <tool_name> <json arguments>\n\
+STEP: <tool_name> <json arguments>\n\
+PLAN: <short summary>\n\
+Do not reply with FINAL or FINAL_OK.",
+            reason
         ),
         TaskDirectiveContext::Replan {
             summary,

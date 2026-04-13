@@ -24,6 +24,7 @@ typeset -g NOODLE_MAX_RETRY_DEPTH="${NOODLE_MAX_RETRY_DEPTH:-}"
 typeset -g NOODLE_PLUGIN_ORDER="${NOODLE_PLUGIN_ORDER:-}"
 typeset -g NOODLE_SELECTION_MODE="${NOODLE_SELECTION_MODE:-}"
 typeset -g NOODLE_SLASH_COMMANDS="${NOODLE_SLASH_COMMANDS:-}"
+typeset -g NOODLE_CHAT_PREFIX_VALUE="${NOODLE_CHAT_PREFIX:-}"
 typeset -g NOODLE_DEBUG_OVERRIDE="${NOODLE_DEBUG-__NOODLE_UNSET__}"
 typeset -g NOODLE_AUTO_RUN_OVERRIDE="${NOODLE_AUTO_RUN-__NOODLE_UNSET__}"
 typeset -g NOODLE_ENABLE_ERROR_FALLBACK_OVERRIDE="${NOODLE_ENABLE_ERROR_FALLBACK-__NOODLE_UNSET__}"
@@ -31,6 +32,7 @@ typeset -g NOODLE_MAX_RETRY_DEPTH_OVERRIDE="${NOODLE_MAX_RETRY_DEPTH-__NOODLE_UN
 typeset -g NOODLE_PLUGIN_ORDER_OVERRIDE="${NOODLE_PLUGIN_ORDER-__NOODLE_UNSET__}"
 typeset -g NOODLE_SELECTION_MODE_OVERRIDE="${NOODLE_SELECTION_MODE-__NOODLE_UNSET__}"
 typeset -g NOODLE_SLASH_COMMANDS_OVERRIDE="${NOODLE_SLASH_COMMANDS-__NOODLE_UNSET__}"
+typeset -g NOODLE_CHAT_PREFIX_OVERRIDE="${NOODLE_CHAT_PREFIX-__NOODLE_UNSET__}"
 typeset -g NOODLE_RAW_SESSION_OUTPUT_ACTIVE=0
 typeset -g NOODLE_PENDING_SLASH_COMMAND=""
 
@@ -44,6 +46,7 @@ function _noodle_reset_runtime_config() {
   NOODLE_PLUGIN_ORDER=""
   NOODLE_SELECTION_MODE=""
   NOODLE_SLASH_COMMANDS=""
+  NOODLE_CHAT_PREFIX_VALUE=""
   [[ "$NOODLE_DEBUG_OVERRIDE" != "__NOODLE_UNSET__" ]] && NOODLE_DEBUG="$NOODLE_DEBUG_OVERRIDE"
   [[ "$NOODLE_AUTO_RUN_OVERRIDE" != "__NOODLE_UNSET__" ]] && NOODLE_AUTO_RUN="$NOODLE_AUTO_RUN_OVERRIDE"
   [[ "$NOODLE_ENABLE_ERROR_FALLBACK_OVERRIDE" != "__NOODLE_UNSET__" ]] && NOODLE_ENABLE_ERROR_FALLBACK="$NOODLE_ENABLE_ERROR_FALLBACK_OVERRIDE"
@@ -51,6 +54,7 @@ function _noodle_reset_runtime_config() {
   [[ "$NOODLE_PLUGIN_ORDER_OVERRIDE" != "__NOODLE_UNSET__" ]] && NOODLE_PLUGIN_ORDER="$NOODLE_PLUGIN_ORDER_OVERRIDE"
   [[ "$NOODLE_SELECTION_MODE_OVERRIDE" != "__NOODLE_UNSET__" ]] && NOODLE_SELECTION_MODE="$NOODLE_SELECTION_MODE_OVERRIDE"
   [[ "$NOODLE_SLASH_COMMANDS_OVERRIDE" != "__NOODLE_UNSET__" ]] && NOODLE_SLASH_COMMANDS="$NOODLE_SLASH_COMMANDS_OVERRIDE"
+  [[ "$NOODLE_CHAT_PREFIX_OVERRIDE" != "__NOODLE_UNSET__" ]] && NOODLE_CHAT_PREFIX_VALUE="$NOODLE_CHAT_PREFIX_OVERRIDE"
 }
 
 function _noodle_load_runtime_config() {
@@ -68,6 +72,7 @@ function _noodle_load_runtime_config() {
       plugin_order) [[ -z "$NOODLE_PLUGIN_ORDER" ]] && NOODLE_PLUGIN_ORDER="$value" ;;
       selection_mode) [[ -z "$NOODLE_SELECTION_MODE" ]] && NOODLE_SELECTION_MODE="$value" ;;
       slash_commands) [[ -z "$NOODLE_SLASH_COMMANDS" ]] && NOODLE_SLASH_COMMANDS="$value" ;;
+      chat_prefix) [[ -z "$NOODLE_CHAT_PREFIX_VALUE" ]] && NOODLE_CHAT_PREFIX_VALUE="$value" ;;
     esac
   done <<< "$payload"
 
@@ -75,9 +80,10 @@ function _noodle_load_runtime_config() {
   [[ -n "$NOODLE_AUTO_RUN" ]] || NOODLE_AUTO_RUN=1
   [[ -n "$NOODLE_ENABLE_ERROR_FALLBACK" ]] || NOODLE_ENABLE_ERROR_FALLBACK=0
   [[ -n "$NOODLE_MAX_RETRY_DEPTH" ]] || NOODLE_MAX_RETRY_DEPTH=2
-  [[ -n "$NOODLE_PLUGIN_ORDER" ]] || NOODLE_PLUGIN_ORDER="utils memory todo chat typos"
+  [[ -n "$NOODLE_PLUGIN_ORDER" ]] || NOODLE_PLUGIN_ORDER="utils memory scripting todo chat typos"
   [[ -n "$NOODLE_SELECTION_MODE" ]] || NOODLE_SELECTION_MODE="select"
-  [[ -n "$NOODLE_SLASH_COMMANDS" ]] || NOODLE_SLASH_COMMANDS="help status reload config memory todo"
+  [[ -n "$NOODLE_SLASH_COMMANDS" ]] || NOODLE_SLASH_COMMANDS="help status reload config memory kv todo"
+  [[ -n "$NOODLE_CHAT_PREFIX_VALUE" ]] || NOODLE_CHAT_PREFIX_VALUE=","
   NOODLE_RUNTIME_LOADED=1
 }
 
@@ -95,22 +101,22 @@ function _noodle_ensure_daemon() {
 }
 
 function _noodle_debug_enabled() {
-  _noodle_load_runtime_config
+  [[ -n "$NOODLE_DEBUG" ]] || NOODLE_DEBUG=0
   [[ "$NOODLE_DEBUG" != "0" ]]
 }
 
 function _noodle_auto_run_enabled() {
-  _noodle_load_runtime_config
+  [[ -n "$NOODLE_AUTO_RUN" ]] || NOODLE_AUTO_RUN=1
   [[ "$NOODLE_AUTO_RUN" == "1" ]]
 }
 
 function _noodle_error_fallback_enabled() {
-  _noodle_load_runtime_config
+  [[ -n "$NOODLE_ENABLE_ERROR_FALLBACK" ]] || NOODLE_ENABLE_ERROR_FALLBACK=0
   [[ "$NOODLE_ENABLE_ERROR_FALLBACK" == "1" ]]
 }
 
 function _noodle_max_retry_depth() {
-  _noodle_load_runtime_config
+  [[ -n "$NOODLE_MAX_RETRY_DEPTH" ]] || NOODLE_MAX_RETRY_DEPTH=2
   print -r -- "$NOODLE_MAX_RETRY_DEPTH"
 }
 
@@ -142,9 +148,9 @@ function _noodle_avatar_render() {
   local frame="$1"
   local suffix="${2:-}"
   if [[ -n "$suffix" ]]; then
-    printf '\r\033[38;2;107;63;160m%s\033[0m\t%s' "$frame" "$suffix" >&2
+    printf '\r\033[2K\033[38;2;107;63;160m%s\033[0m\t%s' "$frame" "$suffix" >&2
   else
-    printf '\r\033[38;2;107;63;160m%s\033[0m' "$frame" >&2
+    printf '\r\033[2K\033[38;2;107;63;160m%s\033[0m' "$frame" >&2
   fi
 }
 
@@ -169,7 +175,7 @@ function _noodle_avatar_wait() {
   emulate -L zsh
   local pid="$1"
   local frames=("oO" "Oo")
-  local dots=("." ".." "...")
+  local dots=("" "." ".." "...")
   local i=1
   local j=1
   while kill -0 "$pid" 2>/dev/null; do
@@ -178,6 +184,30 @@ function _noodle_avatar_wait() {
     j=$(( (j % ${#dots}) + 1 ))
     sleep 0.5
   done
+  _noodle_avatar_clear
+}
+
+function _noodle_avatar_spin() {
+  emulate -L zsh
+  local frames=("oO" "Oo")
+  local dots=("" "." ".." "...")
+  local i=1
+  local j=1
+  while true; do
+    _noodle_avatar_render "${frames[i]}" "${dots[j]}"
+    i=$(( (i % ${#frames}) + 1 ))
+    j=$(( (j % ${#dots}) + 1 ))
+    sleep 0.25
+  done
+}
+
+function _noodle_avatar_stop_spinner() {
+  emulate -L zsh
+  local pid="$1"
+  if [[ -n "$pid" ]]; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
   _noodle_avatar_clear
 }
 
@@ -294,7 +324,7 @@ function _noodle_stream_helper() {
   local input="$2"
   local exit_status="$3"
   local selected_command="${4:-}"
-  local stderr_file fifo helper_pid helper_status=0 line last_status=0
+  local stderr_file fifo helper_pid helper_status=0 line last_status=0 saw_payload=0 spinner_pid=""
 
   stderr_file="$(mktemp "${TMPDIR:-/tmp}/noodle-stream.stderr.XXXXXX")" || return 1
   fifo="$(mktemp -u "${TMPDIR:-/tmp}/noodle-stream.out.XXXXXX")" || {
@@ -318,9 +348,16 @@ function _noodle_stream_helper() {
     --config "$NOODLE_CONFIG" \
     >"$fifo" 2>"$stderr_file" &
   helper_pid=$!
+  _noodle_avatar_spin &
+  spinner_pid=$!
 
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
+    if (( ! saw_payload )); then
+      _noodle_avatar_stop_spinner "$spinner_pid"
+      spinner_pid=""
+      saw_payload=1
+    fi
     noodle_log_debug "host" "stream payload: $line"
     _noodle_handle_payload "$line"
     last_status=$?
@@ -328,6 +365,7 @@ function _noodle_stream_helper() {
 
   wait "$helper_pid"
   helper_status=$?
+  [[ -n "$spinner_pid" ]] && _noodle_avatar_stop_spinner "$spinner_pid"
 
   if _noodle_debug_enabled && [[ -s "$stderr_file" ]]; then
     cat "$stderr_file" >&2
@@ -578,22 +616,24 @@ function noodle_handle_payload() {
 
 function _noodle_registered_slash_command_name() {
   emulate -L zsh
-  _noodle_load_runtime_config
   local raw_input="$1"
   local trimmed="${raw_input#"${raw_input%%[![:space:]]*}"}"
   [[ "$trimmed" == /* ]] || return 1
   local name="${trimmed#/}"
   name="${name%%[[:space:]]*}"
   [[ -n "$name" ]] || return 1
-  case " ${NOODLE_SLASH_COMMANDS} " in
-    *" ${name} "*) print -r -- "$name"; return 0 ;;
+  [[ "$name" != */* ]] || return 1
+  case "$name" in
+    help|status|reload|config|memory|kv|todo)
+      print -r -- "$name"
+      return 0
+      ;;
   esac
   return 1
 }
 
 function _noodle_dispatch_explicit_input() {
   emulate -L zsh
-  _noodle_load_runtime_config
   local raw_input="$1"
   local mode="command_not_found"
   if _noodle_registered_slash_command_name "$raw_input" >/dev/null; then
@@ -614,8 +654,8 @@ function _noodle_chat_oo() {
 
 function _noodle_chat_prefix() {
   emulate -L zsh
-  local prefix
-  prefix="$(_noodle_config_value "plugins.chat.prefix" ",")"
+  [[ -n "$NOODLE_CHAT_PREFIX_VALUE" ]] || _noodle_load_runtime_config
+  local prefix="$NOODLE_CHAT_PREFIX_VALUE"
   [[ -n "$prefix" ]] || prefix=","
   local raw_input="$prefix"
   if (( $# > 0 )); then

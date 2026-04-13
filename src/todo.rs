@@ -1,7 +1,7 @@
 use crate::actions::DaemonAction;
 use crate::{
-    memory_append_event, memory_after_event, memory_get_state, memory_increment_state_counter,
-    memory_set_state, memory_upsert_artifact, PluginId,
+    PluginId, memory_after_event, memory_append_event, memory_get_state,
+    memory_increment_state_counter, memory_set_state, memory_upsert_artifact,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -234,9 +234,7 @@ fn parse_todo_command(raw_input: &str) -> Result<TodoCommand, String> {
         }
         "x" => parse_todo_id_command(remainder, |id| TodoCommand::Done { id }, "x"),
         "done" => parse_todo_id_command(remainder, |id| TodoCommand::Done { id }, "done"),
-        "reopen" => {
-            parse_todo_id_command(remainder, |id| TodoCommand::Reopen { id }, "reopen")
-        }
+        "reopen" => parse_todo_id_command(remainder, |id| TodoCommand::Reopen { id }, "reopen"),
         "remove" | "rm" => {
             parse_todo_id_command(remainder, |id| TodoCommand::Remove { id }, "remove")
         }
@@ -304,8 +302,14 @@ fn render_todo_list(items: &[TodoItem]) -> String {
     }
 
     let mut lines = Vec::new();
-    let open_count = items.iter().filter(|item| !item.done && !item.partial).count();
-    let partial_count = items.iter().filter(|item| item.partial && !item.done).count();
+    let open_count = items
+        .iter()
+        .filter(|item| !item.done && !item.partial)
+        .count();
+    let partial_count = items
+        .iter()
+        .filter(|item| item.partial && !item.done)
+        .count();
     let done_count = items.iter().filter(|item| item.done).count();
     lines.push(format!(
         "Todos: {} open, {} partial, {} done",

@@ -245,11 +245,7 @@ fn render_memory_search(config: &Value, term: &str) -> Result<String, String> {
         return Ok(format!("No memory matches for \"{}\".", term));
     }
 
-    Ok(format!(
-        "Memory search: {}\n{}",
-        term,
-        lines.join("\n")
-    ))
+    Ok(format!("Memory search: {}\n{}", term, lines.join("\n")))
 }
 
 fn clear_memory_scope(config: &Value, scope: &str) -> Result<String, String> {

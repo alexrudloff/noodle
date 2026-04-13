@@ -50,13 +50,18 @@
     }
   },
   "plugins": {
-    "order": ["utils", "memory", "todo", "chat", "typos"],
+    "order": ["utils", "memory", "scripting", "todo", "chat", "typos"],
     "utils": {
       "uses_tools": [],
       "tool_availability": {},
       "exports_tools": []
     },
     "memory": {
+      "uses_tools": [],
+      "tool_availability": {},
+      "exports_tools": []
+    },
+    "scripting": {
       "uses_tools": [],
       "tool_availability": {},
       "exports_tools": []

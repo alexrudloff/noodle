@@ -129,10 +129,7 @@ fn render_help(config: &Value) -> String {
     let mut lines = vec!["Slash commands:".to_string()];
     for command in registered_slash_command_names(config) {
         if let Some(definition) = slash_command_definition(&command) {
-            lines.push(format!(
-                "/{} - {}",
-                definition.name, definition.description
-            ));
+            lines.push(format!("/{} - {}", definition.name, definition.description));
             lines.push(format!("  {}", definition.usage));
         }
     }
@@ -227,8 +224,7 @@ fn handle_config_command(config: &Value, command: ConfigCommand) -> Result<Strin
                 key,
                 path.display(),
                 render_value_inline(
-                    lookup(&current, &key)
-                        .ok_or_else(|| "config write failed".to_string())?
+                    lookup(&current, &key).ok_or_else(|| "config write failed".to_string())?
                 )
             ))
         }
@@ -246,7 +242,9 @@ fn resolved_config_path(config: &Value) -> PathBuf {
     let path = lookup(config, "_meta.config_path")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| env::var("NOODLE_CONFIG").unwrap_or_else(|_| "~/.noodle/config.json".into()));
+        .unwrap_or_else(|| {
+            env::var("NOODLE_CONFIG").unwrap_or_else(|_| "~/.noodle/config.json".into())
+        });
     expand_home(&path)
 }
 

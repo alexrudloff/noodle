@@ -445,6 +445,13 @@ pub fn plugin_manifest(plugin_id: &str) -> PluginManifest {
             uses_tools: vec![],
             exports_mcp_tools: vec![],
         },
+        "scripting" => PluginManifest {
+            id: "scripting",
+            handles_events: vec!["slash_command"],
+            slash_commands: vec!["kv"],
+            uses_tools: vec![],
+            exports_mcp_tools: vec![],
+        },
         "todo" => PluginManifest {
             id: "todo",
             handles_events: vec!["slash_command"],
@@ -475,6 +482,7 @@ pub fn plugin_order(config: &Value) -> Vec<String> {
     vec![
         "utils".into(),
         "memory".into(),
+        "scripting".into(),
         "todo".into(),
         "chat".into(),
         "typos".into(),
@@ -538,6 +546,11 @@ pub fn slash_command_definition(name: &str) -> Option<SlashCommandDefinition> {
             description: "Inspect, search, or clear noodle memory state.",
             usage: "/memory [help|search|clear] ...",
         }),
+        "kv" => Some(SlashCommandDefinition {
+            name: "kv",
+            description: "Shared key/value cache for scripting with optional TTL.",
+            usage: "/kv [help|get|set|unset] ...",
+        }),
         _ => None,
     }
 }
@@ -546,7 +559,8 @@ pub fn registered_slash_command_names(config: &Value) -> Vec<String> {
     let mut names = Vec::new();
     for manifest in enabled_plugin_manifests(config) {
         for command in manifest.slash_commands {
-            if slash_command_definition(command).is_some() && !names.iter().any(|item| item == command)
+            if slash_command_definition(command).is_some()
+                && !names.iter().any(|item| item == command)
             {
                 names.push(command.to_string());
             }
@@ -570,7 +584,10 @@ pub fn slash_command_matches_request(manifest: &PluginManifest, input: &str) -> 
     let Some(name) = slash_command_name(input) else {
         return false;
     };
-    manifest.slash_commands.iter().any(|command| *command == name)
+    manifest
+        .slash_commands
+        .iter()
+        .any(|command| *command == name)
 }
 
 pub fn tools_for_plugin(config: &Value, plugin_id: &str) -> Vec<ToolDefinition> {
@@ -609,7 +626,9 @@ fn plugin_tool_availability(config: &Value, plugin_id: &str) -> HashMap<String, 
         .map(|items| {
             items
                 .iter()
-                .filter_map(|(tool, value)| value.as_bool().map(|available| (tool.clone(), available)))
+                .filter_map(|(tool, value)| {
+                    value.as_bool().map(|available| (tool.clone(), available))
+                })
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default()
@@ -960,7 +979,10 @@ fn tool_glob(args: &Value) -> Result<Value, String> {
             .unwrap_or_default();
         if wildcard_match(pattern, &display)
             || (!relative.is_empty() && wildcard_match(pattern, &relative))
-            || wildcard_match(pattern, path.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+            || wildcard_match(
+                pattern,
+                path.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+            )
         {
             results.push(display);
         }
@@ -1401,8 +1423,8 @@ fn expand_home(path: &str) -> PathBuf {
 mod tests {
     use super::{
         enabled_plugin_manifests, exported_mcp_tools, plugin_matches_request,
-        registered_slash_command_names, slash_command_name, tool_glob, tools_for_plugin,
-        tool_path_search, wildcard_match,
+        registered_slash_command_names, slash_command_name, tool_glob, tool_path_search,
+        tools_for_plugin, wildcard_match,
     };
     use serde_json::json;
     use std::fs;
@@ -1567,7 +1589,10 @@ mod tests {
             .iter()
             .find(|manifest| manifest.id == "todo")
             .unwrap();
-        assert_eq!(slash_command_name("/todo add ship it").as_deref(), Some("todo"));
+        assert_eq!(
+            slash_command_name("/todo add ship it").as_deref(),
+            Some("todo")
+        );
         assert!(plugin_matches_request(
             &config,
             todo,
@@ -1848,7 +1873,9 @@ fn wildcard_match_component(pattern: &[u8], text: &[u8]) -> bool {
                 false
             }
         }
-        c => !text.is_empty() && c == text[0] && wildcard_match_component(&pattern[1..], &text[1..]),
+        c => {
+            !text.is_empty() && c == text[0] && wildcard_match_component(&pattern[1..], &text[1..])
+        }
     }
 }
 
@@ -1857,7 +1884,10 @@ fn normalize_glob_path(input: &str) -> String {
 }
 
 fn split_glob_segments(input: &str) -> Vec<&str> {
-    input.split('/').filter(|segment| !segment.is_empty()).collect()
+    input
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 fn match_bracket_class(pattern: &[u8], value: u8) -> Option<(bool, usize)> {
@@ -2054,7 +2084,8 @@ fn parse_brave_results(body: &Value, limit: usize) -> Vec<Value> {
         .and_then(|web| web.get("results"))
         .and_then(Value::as_array)
         .map(|items| {
-            items.iter()
+            items
+                .iter()
                 .filter_map(|item| {
                     let title = item.get("title").and_then(Value::as_str)?;
                     let url = item.get("url").and_then(Value::as_str)?;

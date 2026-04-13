@@ -14,15 +14,86 @@ The shell adapter forwards events to the daemon. The daemon decides what to do, 
 
 ## Overview
 
-`noodle` ships with five daemon plugins:
+`noodle` ships with six daemon plugins:
 
 - [utils](docs/plugins/utils/README.md) - deterministic slash commands for help, status, reload, and config inspection/editing
 - [memory](docs/plugins/memory/README.md) - deterministic inspection, search, and clearing of noodle's shared memory
+- [scripting](docs/plugins/scripting/README.md) - deterministic shell-scripting primitives such as shared KV storage with TTL
 - [todo](docs/plugins/todo/README.md) - a small terminal todo list stored in shared memory
 - [chat](docs/plugins/chat/README.md) - the main agentic assistant with tool use, planning, tasks, and interactive shell support
 - [typos](docs/plugins/typos/README.md) - typo recovery for `command not found` and optional command-error fallback
 
 Each plugin has its own README with behavior, commands, and configuration.
+
+## Plugin Guide
+
+The plugins are intentionally split by job. Some surfaces are deterministic and fast, some are model-assisted, and some are mostly there to make shell workflows less brittle.
+
+### `utils`
+
+What it is:
+The control plane for noodle itself. It owns slash commands like `/help`, `/status`, `/reload`, and `/config ...`.
+
+Why you would want it:
+Use `utils` when you need to inspect what noodle is doing, verify the active config, reload shell-side runtime state, or make config edits without opening JSON by hand.
+
+Typical commands:
+`/help`, `/status`, `/reload`, `/config get plugins.order`
+
+### `memory`
+
+What it is:
+An operator view over noodle's shared SQLite memory. It summarizes usage, searches across stored state, and clears memory by plugin or globally.
+
+Why you would want it:
+Use `memory` when you want to understand what noodle has stored, debug odd behavior, inspect task/chat/todo residue, or wipe stale plugin state without deleting the whole DB.
+
+Typical commands:
+`/memory`, `/memory search deploy`, `/memory clear todo`
+
+### `scripting`
+
+What it is:
+A deterministic shell-scripting bundle for small shared-state primitives. Right now it exposes `/kv` with optional TTL.
+
+Why you would want it:
+Use `scripting` from shell scripts, cron jobs, launchd jobs, or ad hoc terminal workflows when you need a tiny shared cache across shells without rolling your own temp files, lock files, or sqlite glue.
+
+Typical commands:
+`/kv set session-token abc123 --ttl 5m`, `/kv get session-token`, `/kv unset session-token`
+
+### `todo`
+
+What it is:
+A lightweight terminal todo list stored in noodle's shared memory with stable numeric ids and deterministic commands.
+
+Why you would want it:
+Use `todo` when you want a low-friction backlog right in the terminal, especially for short-lived work you do not want to push into a separate app or issue tracker.
+
+Typical commands:
+`/todo add document plugins`, `/todo list`, `/todo x 2`
+
+### `chat`
+
+What it is:
+The main agentic assistant behind `oo ...` and the configurable chat prefix. It can inspect the workspace, call tools, write files, run short plans, and drive interactive terminal sessions.
+
+Why you would want it:
+Use `chat` when the task is open-ended or multi-step: understanding a repo, editing code, gathering context, using built-in tools, or completing a task that benefits from planning and permission-aware execution.
+
+Typical entry points:
+`oo what changed in this repo?`, `, summarize this file`, MCP `chat.send`
+
+### `typos`
+
+What it is:
+The typo-recovery path for `command not found`, with optional handling for broader command failures when error fallback is enabled.
+
+Why you would want it:
+Use `typos` if you want the shell to recover from mistakes faster, either by showing likely intended commands or auto-running the top correction in a controlled way.
+
+Typical behavior:
+Turns a failed shell command into a short correction menu or an automatic retry, depending on `selection_mode` and `auto_run`.
 
 ## How It Works
 
@@ -63,6 +134,24 @@ That script:
 - installs files into `~/.noodle`
 - installs a launch agent at `~/Library/LaunchAgents/com.noodle.daemon.plist`
 - bootstraps and kickstarts the daemon with `launchctl`
+- on first install, prompts for provider/model/API-key details and writes them into `~/.noodle/config.json`
+
+If you rerun the installer in an interactive terminal, it can also update the configured model settings.
+
+To skip installer prompts entirely:
+
+```sh
+NOODLE_INSTALL_CONFIGURE_LLM=0 ./scripts/install.sh
+```
+
+To preseed installer values non-interactively:
+
+```sh
+NOODLE_INSTALL_PROVIDER=openai_responses \
+NOODLE_INSTALL_MODEL=gpt-5 \
+NOODLE_INSTALL_API_KEY=... \
+./scripts/install.sh
+```
 
 Then add this to `~/.zshrc`:
 
@@ -92,6 +181,7 @@ Deterministic slash commands:
 /status
 /reload
 /memory
+/kv set session-token abc123 --ttl 5m
 /todo add document the repo
 /todo list
 ```
@@ -234,6 +324,7 @@ Plugin-specific settings are documented here:
 
 - [utils plugin config](docs/plugins/utils/README.md#configuration)
 - [memory plugin config](docs/plugins/memory/README.md#configuration)
+- [scripting plugin config](docs/plugins/scripting/README.md#configuration)
 - [todo plugin config](docs/plugins/todo/README.md#configuration)
 - [chat plugin config](docs/plugins/chat/README.md#configuration)
 - [typos plugin config](docs/plugins/typos/README.md#configuration)
@@ -292,6 +383,16 @@ Adapter and daemon wiring:
 - `NOODLE_HELPER`
 - `NOODLE_SOCKET`
 - `NOODLE_PIDFILE`
+
+Installer-only variables:
+
+- `NOODLE_INSTALL_CONFIGURE_LLM`
+- `NOODLE_INSTALL_PROVIDER`
+- `NOODLE_INSTALL_BASE_URL`
+- `NOODLE_INSTALL_API_KEY`
+- `NOODLE_INSTALL_MODEL`
+- `NOODLE_INSTALL_REASONING_EFFORT`
+- `NOODLE_INSTALL_TIMEOUT_SECONDS`
 
 ## Slash Commands
 

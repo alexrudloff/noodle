@@ -1,11 +1,14 @@
 #![recursion_limit = "512"]
 
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn noodle_bin() -> &'static str {
     env!("CARGO_BIN_EXE_noodle")
@@ -174,13 +177,18 @@ fn write_test_config(temp: &TempDir, selection_mode: &str) -> PathBuf {
             }
         },
         "plugins": {
-            "order": ["utils", "memory", "todo", "chat", "typos"],
+            "order": ["utils", "memory", "scripting", "todo", "chat", "typos"],
             "utils": {
                 "uses_tools": [],
                 "tool_availability": {},
                 "exports_tools": []
             },
             "memory": {
+                "uses_tools": [],
+                "tool_availability": {},
+                "exports_tools": []
+            },
+            "scripting": {
                 "uses_tools": [],
                 "tool_availability": {},
                 "exports_tools": []
@@ -331,11 +339,7 @@ fn run_tool(
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn run_tool_batch(
-    temp: &TempDir,
-    config: &Path,
-    calls: serde_json::Value,
-) -> serde_json::Value {
+fn run_tool_batch(temp: &TempDir, config: &Path, calls: serde_json::Value) -> serde_json::Value {
     let socket = temp.path().join("noodle.sock");
     let pidfile = temp.path().join("noodle.pid");
     let output = Command::new(noodle_bin())
@@ -527,6 +531,67 @@ fn chat_works_through_oo_alias_end_to_end() {
 }
 
 #[test]
+fn oo_dispatch_does_not_fetch_runtime_config() {
+    let temp = TempDir::new("noodle-e2e-chat-thin-dispatch");
+    let config = write_test_config(&temp, "auto");
+    let marker = temp.path().join("runtime-config.log");
+    let helper = temp.path().join("noodle-helper.sh");
+    fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"runtime-config\" ]; then printf 'runtime-config\\n' >> '{}'\nfi\nexec '{}' \"$@\"\n",
+            marker.display(),
+            noodle_bin()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&helper).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&helper, perms).unwrap();
+    }
+
+    let socket = temp.path().join("noodle.sock");
+    let pidfile = temp.path().join("noodle.pid");
+    let output = Command::new("/bin/zsh")
+        .arg("-ic")
+        .arg(format!(
+            "source '{}'; _noodle_chat_oo hello",
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("plugin/noodle.plugin.zsh")
+                .display(),
+        ))
+        .env("HOME", temp.path())
+        .env("NOODLE_HELPER", &helper)
+        .env("NOODLE_CONFIG", &config)
+        .env("NOODLE_SOCKET", &socket)
+        .env("NOODLE_PIDFILE", &pidfile)
+        .env("NOODLE_BYPASS_DAEMON", "1")
+        .output()
+        .unwrap();
+    kill_daemon(&pidfile, &socket);
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ));
+    assert!(
+        combined.contains("chat-ok"),
+        "expected chat response, got:\n{}",
+        combined
+    );
+    assert!(
+        fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "oo dispatch should not call runtime-config, got:\n{}",
+        fs::read_to_string(&marker).unwrap_or_default()
+    );
+}
+
+#[test]
 fn chat_works_through_prefix_alias_end_to_end() {
     let temp = TempDir::new("noodle-e2e-prefix");
     let config = write_test_config(&temp, "auto");
@@ -555,7 +620,13 @@ fn todo_slash_commands_work_through_daemon() {
     let temp = TempDir::new("noodle-e2e-todo");
     let config = write_test_config(&temp, "auto");
 
-    let added = run_mode(&temp, &config, "slash_command", "/todo add ship noodle", None);
+    let added = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/todo add ship noodle",
+        None,
+    );
     assert_eq!(added["action"].as_str(), Some("message"));
     assert!(
         added["message"]
@@ -626,7 +697,7 @@ fn slash_command_runtime_config_and_adapter_path_are_available() {
         .output()
         .unwrap();
     let runtime_text = String::from_utf8_lossy(&runtime.stdout);
-    assert!(runtime_text.contains("slash_commands=help status reload config memory todo"));
+    assert!(runtime_text.contains("slash_commands=help status reload config memory kv todo"));
 
     let output = run_zsh(
         &temp,
@@ -644,15 +715,31 @@ fn utils_slash_commands_work_through_daemon() {
 
     let help = run_mode(&temp, &config, "slash_command", "/help", None);
     let help_text = help["message"].as_str().unwrap_or_default();
-    assert!(help_text.contains("/help - Show available slash commands"), "{help}");
-    assert!(help_text.contains("/reload - Reload noodle runtime config in the current shell."), "{help}");
-    assert!(help_text.contains("/memory - Inspect, search, or clear noodle memory state."), "{help}");
+    assert!(
+        help_text.contains("/help - Show available slash commands"),
+        "{help}"
+    );
+    assert!(
+        help_text.contains("/reload - Reload noodle runtime config in the current shell."),
+        "{help}"
+    );
+    assert!(
+        help_text.contains("/memory - Inspect, search, or clear noodle memory state."),
+        "{help}"
+    );
+    assert!(
+        help_text.contains("/kv - Shared key/value cache for scripting with optional TTL."),
+        "{help}"
+    );
 
     let status = run_mode(&temp, &config, "slash_command", "/status", None);
     let status_text = status["message"].as_str().unwrap_or_default();
     assert!(status_text.contains("Noodle status"), "{status}");
     assert!(status_text.contains("Plugins:"), "{status}");
-    assert!(status_text.contains("Slash commands: /help /status /reload /config /memory /todo"), "{status}");
+    assert!(
+        status_text.contains("Slash commands: /help /status /reload /config /memory /kv /todo"),
+        "{status}"
+    );
 }
 
 #[test]
@@ -672,7 +759,11 @@ print -r -- "after:$NOODLE_AUTO_RUN"
 "#,
     );
     assert!(output.contains("before:1"), "{}", output);
-    assert!(output.contains("Reloaded noodle runtime config."), "{}", output);
+    assert!(
+        output.contains("Reloaded noodle runtime config."),
+        "{}",
+        output
+    );
     assert!(output.contains("after:0"), "{}", output);
 }
 
@@ -681,7 +772,13 @@ fn memory_and_config_slash_commands_work_through_daemon() {
     let temp = TempDir::new("noodle-e2e-memory-config");
     let config = write_test_config(&temp, "auto");
 
-    let added = run_mode(&temp, &config, "slash_command", "/todo add search target", None);
+    let added = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/todo add search target",
+        None,
+    );
     assert!(
         added["message"]
             .as_str()
@@ -694,11 +791,90 @@ fn memory_and_config_slash_commands_work_through_daemon() {
     assert!(memory_text.contains("Memory DB:"), "{memory_summary}");
     assert!(memory_text.contains("Plugins:"), "{memory_summary}");
 
-    let memory_search =
-        run_mode(&temp, &config, "slash_command", "/memory search search target", None);
+    let memory_search = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/memory search search target",
+        None,
+    );
     let search_text = memory_search["message"].as_str().unwrap_or_default();
-    assert!(search_text.contains("Memory search: search target"), "{memory_search}");
+    assert!(
+        search_text.contains("Memory search: search target"),
+        "{memory_search}"
+    );
     assert!(search_text.contains("search target"), "{memory_search}");
+
+    let cache_set = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/kv set session-token abc123 --ttl 1s",
+        None,
+    );
+    assert!(
+        cache_set["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Set kv key session-token. TTL 1s"),
+        "{cache_set}"
+    );
+
+    let cache_get = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/kv get session-token",
+        None,
+    );
+    assert_eq!(cache_get["message"].as_str(), Some("abc123"));
+
+    thread::sleep(Duration::from_millis(1100));
+
+    let cache_expired = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/kv get session-token",
+        None,
+    );
+    assert!(
+        cache_expired["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("KV key not found: session-token"),
+        "{cache_expired}"
+    );
+
+    let cache_set_persistent = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/kv set shell-cache keep-me",
+        None,
+    );
+    assert!(
+        cache_set_persistent["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Set kv key shell-cache."),
+        "{cache_set_persistent}"
+    );
+
+    let cache_unset = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/kv unset shell-cache",
+        None,
+    );
+    assert!(
+        cache_unset["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Removed kv key shell-cache."),
+        "{cache_unset}"
+    );
 
     let config_get = run_mode(
         &temp,
@@ -733,8 +909,7 @@ fn memory_and_config_slash_commands_work_through_daemon() {
     );
     assert_eq!(config_get_debug["message"].as_str(), Some("true"));
 
-    let memory_clear =
-        run_mode(&temp, &config, "slash_command", "/memory clear todo", None);
+    let memory_clear = run_mode(&temp, &config, "slash_command", "/memory clear todo", None);
     assert!(
         memory_clear["message"]
             .as_str()
@@ -1045,12 +1220,19 @@ fn chat_can_handle_a_numbered_interactive_approval_menu() {
     let items = result["items"].as_array().unwrap();
     assert!(items.iter().any(|item| {
         item["action"].as_str() == Some("session_output")
-            && item["text"].as_str().unwrap_or("").contains("Do you want to proceed?")
+            && item["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Do you want to proceed?")
     }));
-    assert!(items.iter().any(|item| {
-        item["action"].as_str() == Some("session_input")
-            && item["text"].as_str().unwrap_or("").contains("<Enter>")
-    }), "expected session_input approval choice, got:\n{}", serde_json::to_string_pretty(&result).unwrap());
+    assert!(
+        items.iter().any(|item| {
+            item["action"].as_str() == Some("session_input")
+                && item["text"].as_str().unwrap_or("").contains("<Enter>")
+        }),
+        "expected session_input approval choice, got:\n{}",
+        serde_json::to_string_pretty(&result).unwrap()
+    );
     assert_eq!(
         last_batch_action(&result).and_then(|item| item["message"].as_str()),
         Some("selected 1")
@@ -1088,10 +1270,14 @@ fn chat_can_handle_a_long_screen_interactive_approval_menu() {
     );
     assert_eq!(result["action"], "batch");
     let items = result["items"].as_array().unwrap();
-    assert!(items.iter().any(|item| {
-        item["action"].as_str() == Some("session_input")
-            && item["text"].as_str().unwrap_or("").contains("<Enter>")
-    }), "expected session_input approval choice, got:\n{}", serde_json::to_string_pretty(&result).unwrap());
+    assert!(
+        items.iter().any(|item| {
+            item["action"].as_str() == Some("session_input")
+                && item["text"].as_str().unwrap_or("").contains("<Enter>")
+        }),
+        "expected session_input approval choice, got:\n{}",
+        serde_json::to_string_pretty(&result).unwrap()
+    );
     assert_eq!(
         last_batch_action(&result).and_then(|item| item["message"].as_str()),
         Some("selected 1")
@@ -1129,10 +1315,14 @@ fn chat_can_handle_a_highlighted_interactive_approval_menu() {
     );
     assert_eq!(result["action"], "batch");
     let items = result["items"].as_array().unwrap();
-    assert!(items.iter().any(|item| {
-        item["action"].as_str() == Some("session_input")
-            && item["text"].as_str().unwrap_or("").contains("<Enter>")
-    }), "expected highlighted menu approval choice, got:\n{}", serde_json::to_string_pretty(&result).unwrap());
+    assert!(
+        items.iter().any(|item| {
+            item["action"].as_str() == Some("session_input")
+                && item["text"].as_str().unwrap_or("").contains("<Enter>")
+        }),
+        "expected highlighted menu approval choice, got:\n{}",
+        serde_json::to_string_pretty(&result).unwrap()
+    );
     assert_eq!(
         last_batch_action(&result).and_then(|item| item["message"].as_str()),
         Some("selected 1")
@@ -1174,10 +1364,14 @@ fn planned_task_keeps_driving_an_interactive_menu_before_finalizing() {
     );
     assert_eq!(result["action"], "batch");
     let items = result["items"].as_array().unwrap();
-    assert!(items.iter().any(|item| {
-        item["action"].as_str() == Some("session_input")
-            && item["text"].as_str().unwrap_or("").contains("<Enter>")
-    }), "expected session_input approval choice, got:\n{}", serde_json::to_string_pretty(&result).unwrap());
+    assert!(
+        items.iter().any(|item| {
+            item["action"].as_str() == Some("session_input")
+                && item["text"].as_str().unwrap_or("").contains("<Enter>")
+        }),
+        "expected session_input approval choice, got:\n{}",
+        serde_json::to_string_pretty(&result).unwrap()
+    );
     assert_eq!(
         last_batch_action(&result).and_then(|item| item["message"].as_str()),
         Some("selected 1")
@@ -1218,7 +1412,9 @@ fn interactive_shell_read_preserves_display_ansi_but_strips_control_noise() {
     );
     let results = batch["results"].as_array().unwrap();
     let plain = results[1]["output"]["output"].as_str().unwrap_or("");
-    let display = results[1]["output"]["display_output"].as_str().unwrap_or("");
+    let display = results[1]["output"]["display_output"]
+        .as_str()
+        .unwrap_or("");
     assert!(plain.contains("red"));
     assert!(!plain.contains("\u{1b}[?1;2c"));
     assert!(display.contains("red"));
@@ -1514,7 +1710,11 @@ fn zsh_streams_interactive_shell_progress_live() {
     let config = write_test_config(&temp, "auto");
     set_config_permissions_allow(&config);
 
-    let output = run_zsh(&temp, &config, "oo talk to the interactive harness and tell it alex");
+    let output = run_zsh(
+        &temp,
+        &config,
+        "oo talk to the interactive harness and tell it alex",
+    );
     assert!(
         output.contains("$ printf 'name? '; read name; printf 'hi:%s' $name"),
         "expected transcript command launch, got:\n{}",
@@ -1772,7 +1972,11 @@ fn all_builtin_primitives_are_covered_and_work() {
     let mut brave_config: Value =
         serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
     brave_config["search"]["provider"] = Value::String("brave_api".into());
-    fs::write(&config, serde_json::to_string_pretty(&brave_config).unwrap()).unwrap();
+    fs::write(
+        &config,
+        serde_json::to_string_pretty(&brave_config).unwrap(),
+    )
+    .unwrap();
     let brave_search = run_tool(
         &temp,
         &config,
@@ -1792,7 +1996,10 @@ fn all_builtin_primitives_are_covered_and_work() {
         brave_search["output"]["provider"].as_str(),
         Some("brave_api")
     );
-    assert_eq!(brave_search["output"]["results"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        brave_search["output"]["results"].as_array().unwrap().len(),
+        1
+    );
 
     let file_write_path = root.join("written.txt");
     let file_write = run_tool(
@@ -1932,7 +2139,10 @@ fn all_builtin_primitives_are_covered_and_work() {
     );
     let idle_results = idle_read["results"].as_array().unwrap();
     assert_eq!(idle_results[2]["output"]["output"].as_str(), Some(""));
-    assert_eq!(idle_results[2]["output"]["display_output"].as_str(), Some(""));
+    assert_eq!(
+        idle_results[2]["output"]["display_output"].as_str(),
+        Some("")
+    );
     assert!(
         idle_results[2]["output"]["screen_text"]
             .as_str()
@@ -2012,10 +2222,7 @@ fn all_builtin_primitives_are_covered_and_work() {
         "expected raw-mode helper to signal readiness, got:\n{}",
         raw_results[1]
     );
-    assert_eq!(
-        raw_results[2]["output"]["bytes_written"].as_u64(),
-        Some(1)
-    );
+    assert_eq!(raw_results[2]["output"]["bytes_written"].as_u64(), Some(1));
     assert_eq!(raw_results[2]["output"]["key"].as_str(), Some("Enter"));
     assert!(
         raw_results[3]["output"]["output"]
@@ -2089,7 +2296,10 @@ fn chat_tool_harness_prints_model_selected_tools_and_results() {
 
     let scenarios = vec![
         ("oo find me the README file in this repo", "path_search"),
-        ("oo show me the contents of README.md in this directory", "file_read"),
+        (
+            "oo show me the contents of README.md in this directory",
+            "file_read",
+        ),
         ("oo list every txt file under the harness folder", "glob"),
         ("oo search the harness folder for the word needle", "grep"),
         ("oo fetch https://example.test/page", "web_fetch"),
@@ -2102,7 +2312,10 @@ fn chat_tool_harness_prints_model_selected_tools_and_results() {
             "oo replace before with after in harness/edit-target.txt",
             "file_edit",
         ),
-        ("oo run printf harness-shell-ok in the harness folder", "shell_exec"),
+        (
+            "oo run printf harness-shell-ok in the harness folder",
+            "shell_exec",
+        ),
         (
             "oo read the MCP memory summary resource from docs",
             "mcp_resource_read",
@@ -2115,7 +2328,10 @@ fn chat_tool_harness_prints_model_selected_tools_and_results() {
             "oo create an agent handoff for planner saying remember this",
             "agent_handoff_create",
         ),
-        ("oo show me the current task artifacts in noodle memory", "memory_query"),
+        (
+            "oo show me the current task artifacts in noodle memory",
+            "memory_query",
+        ),
     ];
 
     for (request, expected_tool) in scenarios {

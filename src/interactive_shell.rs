@@ -372,7 +372,10 @@ fn sanitize_terminal_output(input: &str, mode: TerminalRenderMode) -> String {
                 i += 1;
                 while i < bytes.len() {
                     let byte = bytes[i];
-                    if byte == 0x1b || byte == b'\r' || (byte < 0x20 && byte != b'\n' && byte != b'\t') {
+                    if byte == 0x1b
+                        || byte == b'\r'
+                        || (byte < 0x20 && byte != b'\n' && byte != b'\t')
+                    {
                         break;
                     }
                     i += 1;
@@ -407,10 +410,7 @@ pub fn interactive_shell_start(args: &Value) -> Result<Value, String> {
         .master
         .try_clone_reader()
         .map_err(|err| err.to_string())?;
-    let stdin = pair
-        .master
-        .take_writer()
-        .map_err(|err| err.to_string())?;
+    let stdin = pair.master.take_writer().map_err(|err| err.to_string())?;
     drop(pair.slave);
 
     let session_id = next_session_id();
@@ -502,7 +502,8 @@ pub fn interactive_shell_read(args: &Value) -> Result<Value, String> {
             let Some(total_remaining) = deadline.checked_duration_since(Instant::now()) else {
                 break;
             };
-            let Some(quiet_remaining) = quiet_deadline.checked_duration_since(Instant::now()) else {
+            let Some(quiet_remaining) = quiet_deadline.checked_duration_since(Instant::now())
+            else {
                 break;
             };
             let remaining = total_remaining.min(quiet_remaining);

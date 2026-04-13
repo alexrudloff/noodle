@@ -134,30 +134,34 @@ pub fn resume_chat_execution_from_permission(
         &request,
         &pending.pending_step.tool,
         &pending.pending_step.args,
-        turns.last().map(|turn| &turn.result).expect("tool turn exists"),
+        turns
+            .last()
+            .map(|turn| &turn.result)
+            .expect("tool turn exists"),
         streaming,
     )? {
         progress.push(action);
     }
     let tool_done_summary_text = tool_done_summary(
-            &pending.pending_step.tool,
-            &pending.pending_step.args,
-            turns.last().map(|turn| &turn.result).expect("tool turn exists"),
-        );
+        &pending.pending_step.tool,
+        &pending.pending_step.args,
+        turns
+            .last()
+            .map(|turn| &turn.result)
+            .expect("tool turn exists"),
+    );
 
     match pending.continuation {
-        PendingContinuation::ToolLoop { remaining_rounds } => {
-            execute_tool_loop(
-                config,
-                &request,
-                turns,
-                remaining_rounds,
-                progress,
-                streaming,
-                emitter,
-                model_output,
-            )
-        }
+        PendingContinuation::ToolLoop { remaining_rounds } => execute_tool_loop(
+            config,
+            &request,
+            turns,
+            remaining_rounds,
+            progress,
+            streaming,
+            emitter,
+            model_output,
+        ),
         PendingContinuation::Plan {
             mut task,
             current_step_index,
@@ -700,6 +704,7 @@ fn verify_direct_final(
         ));
     }
 
+    let required_tool_use_reason = required_tool_use_reason(request);
     let prompt = build_chat_execution_prompt(
         &request.base_prompt,
         &request.memory_context,
@@ -709,11 +714,25 @@ fn verify_direct_final(
         &[],
         Some(TaskDirectiveContext::VerifyDirectAnswer {
             draft_answer: direct_text.clone(),
+            required_tool_use_reason: required_tool_use_reason.clone(),
         }),
     );
     let verification_raw = model_output(&prompt)?;
     let verification = clean_text(&verification_raw);
     if verification.eq_ignore_ascii_case("FINAL_OK") {
+        if let Some(reason) = required_tool_use_reason {
+            return force_tool_choice_after_direct_final(
+                config,
+                request,
+                turns,
+                remaining_rounds,
+                progress,
+                streaming,
+                emitter,
+                reason,
+                model_output,
+            );
+        }
         return Ok(finalize_action(
             progress,
             DaemonAction::Message {
@@ -725,15 +744,30 @@ fn verify_direct_final(
     }
 
     match parse_planned_chat_step(&verification_raw) {
-        PlannedChatStep::Final(_) => Ok(finalize_action(
-            progress,
-            DaemonAction::Ask {
-                plugin: request.plugin.clone(),
-                question: "I need to inspect with tools before I can answer that confidently."
-                    .into(),
-            },
-            streaming,
-        )),
+        PlannedChatStep::Final(_) => {
+            if let Some(reason) = required_tool_use_reason {
+                return force_tool_choice_after_direct_final(
+                    config,
+                    request,
+                    turns,
+                    remaining_rounds,
+                    progress,
+                    streaming,
+                    emitter,
+                    reason,
+                    model_output,
+                );
+            }
+            Ok(finalize_action(
+                progress,
+                DaemonAction::Ask {
+                    plugin: request.plugin.clone(),
+                    question: "I need to inspect with tools before I can answer that confidently."
+                        .into(),
+                },
+                streaming,
+            ))
+        }
         PlannedChatStep::Tool(TaskStep { tool: name, args }) => {
             let allowed = request.available_tools.iter().any(|tool| tool.name == name);
             if !allowed {
@@ -741,7 +775,9 @@ fn verify_direct_final(
                     progress,
                     DaemonAction::Ask {
                         plugin: request.plugin.clone(),
-                        question: format!("That request needs a tool that is not available: {name}"),
+                        question: format!(
+                            "That request needs a tool that is not available: {name}"
+                        ),
                     },
                     streaming,
                 ));
@@ -759,11 +795,7 @@ fn verify_direct_final(
                 let mut new_turns = turns;
                 new_turns.push(ToolTurn {
                     tool: name.clone(),
-                    args: prepare_builtin_tool_args(
-                        &name,
-                        &args,
-                        Some(&request.working_directory),
-                    ),
+                    args: prepare_builtin_tool_args(&name, &args, Some(&request.working_directory)),
                     result: ToolCallResult {
                         tool: name,
                         ok: false,
@@ -789,9 +821,7 @@ fn verify_direct_final(
                     tool: name.clone(),
                     args: args.clone(),
                 },
-                PendingContinuation::ToolLoop {
-                    remaining_rounds,
-                },
+                PendingContinuation::ToolLoop { remaining_rounds },
             )? {
                 return Ok(finalize_action(progress, action, streaming));
             }
@@ -803,9 +833,14 @@ fn verify_direct_final(
                 prepare_builtin_tool_args(&name, &args, Some(&request.working_directory));
             let result =
                 invoke_builtin_tool(config, Some(&request.working_directory), &name, &args)?;
-            if let Some(action) =
-                emit_tool_done(emitter, request, &name, &normalized_args, &result, streaming)?
-            {
+            if let Some(action) = emit_tool_done(
+                emitter,
+                request,
+                &name,
+                &normalized_args,
+                &result,
+                streaming,
+            )? {
                 next_progress.push(action);
             }
             let mut new_turns = turns;
@@ -853,6 +888,76 @@ fn verify_direct_final(
     }
 }
 
+fn force_tool_choice_after_direct_final(
+    config: &Value,
+    request: &ChatExecutionConfig,
+    turns: Vec<ToolTurn>,
+    remaining_rounds: usize,
+    progress: Vec<DaemonAction>,
+    streaming: bool,
+    emitter: &mut dyn FnMut(&DaemonAction) -> Result<(), String>,
+    reason: String,
+    model_output: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<DaemonAction, String> {
+    let turn_contexts = tool_turn_contexts(&turns);
+    let prompt = build_chat_execution_prompt(
+        &request.base_prompt,
+        &request.memory_context,
+        &request.available_tools,
+        request.include_tool_context,
+        request.tool_calling_enabled,
+        &turn_contexts,
+        Some(TaskDirectiveContext::ForceToolChoice {
+            reason: reason.clone(),
+        }),
+    );
+    let forced_raw = model_output(&prompt)?;
+    match parse_planned_chat_step(&forced_raw) {
+        PlannedChatStep::Tool(step) => continue_tool_loop_with_step(
+            config,
+            request,
+            turns,
+            progress,
+            remaining_rounds,
+            streaming,
+            emitter,
+            model_output,
+            step,
+        ),
+        PlannedChatStep::Plan(plan) => {
+            if !request.task_execution_enabled {
+                return Ok(finalize_action(
+                    progress,
+                    DaemonAction::Ask {
+                        plugin: request.plugin.clone(),
+                        question: "That request needs multi-step planning, but task execution is disabled.".into(),
+                    },
+                    streaming,
+                ));
+            }
+            execute_plan(
+                config,
+                request,
+                plan,
+                turns,
+                request.max_replans,
+                progress,
+                streaming,
+                emitter,
+                model_output,
+            )
+        }
+        PlannedChatStep::Final(_) => Ok(finalize_action(
+            progress,
+            DaemonAction::Ask {
+                plugin: request.plugin.clone(),
+                question: reason,
+            },
+            streaming,
+        )),
+    }
+}
+
 fn request_explicitly_wants_exact_output(input: &str) -> bool {
     let text = input.to_lowercase();
     [
@@ -889,6 +994,77 @@ fn request_explicitly_wants_summary(input: &str) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn request_likely_needs_local_write(input: &str) -> bool {
+    let text = input.to_lowercase();
+    if [
+        "how do i",
+        "how to",
+        "what command",
+        "show me the command",
+        "which command",
+        "example command",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+    {
+        return false;
+    }
+    let has_write_verb = [
+        "create",
+        "write",
+        "save",
+        "append",
+        "edit",
+        "update",
+        "modify",
+        "rewrite",
+        "replace",
+        "overwrite",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle));
+    if !has_write_verb {
+        return false;
+    }
+    [
+        " file",
+        " files",
+        ".md",
+        ".txt",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".rs",
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        "readme",
+        "package.json",
+        "config",
+        "document",
+        "note",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn required_tool_use_reason(request: &ChatExecutionConfig) -> Option<String> {
+    let has_write_tool = request
+        .available_tools
+        .iter()
+        .any(|tool| matches!(tool.name, "file_write" | "file_edit"));
+    if has_write_tool && request_likely_needs_local_write(&request.input) {
+        return Some(
+            "The user asked you to create or modify a local file, so you must choose a local write tool before responding."
+                .into(),
+        );
+    }
+    None
 }
 
 fn request_explicitly_targets_noodle(input: &str) -> bool {
@@ -1478,7 +1654,8 @@ fn resolve_turn_args(value: &Value, turns: &[ToolTurn]) -> Value {
     match value {
         Value::String(text) => resolve_turn_reference(text, turns).unwrap_or_else(|| value.clone()),
         Value::Array(items) => Value::Array(
-            items.iter()
+            items
+                .iter()
                 .map(|item| resolve_turn_args(item, turns))
                 .collect(),
         ),
@@ -1923,10 +2100,10 @@ fn execute_tool_step_inline(
     if let Some(action) = emit_tool_running(emitter, request, tool, args, streaming)? {
         progress.push(action);
     }
-    let normalized_args =
-        prepare_builtin_tool_args(tool, args, Some(&request.working_directory));
+    let normalized_args = prepare_builtin_tool_args(tool, args, Some(&request.working_directory));
     let result = invoke_builtin_tool(config, Some(&request.working_directory), tool, args)?;
-    if let Some(action) = emit_tool_done(emitter, request, tool, &normalized_args, &result, streaming)?
+    if let Some(action) =
+        emit_tool_done(emitter, request, tool, &normalized_args, &result, streaming)?
     {
         progress.push(action);
     }
@@ -1937,13 +2114,7 @@ fn execute_tool_step_inline(
     });
     if interactive_session_needs_observation(turns) {
         let _ = maybe_autoread_active_interactive_session(
-            config,
-            request,
-            turns,
-            progress,
-            streaming,
-            emitter,
-            true,
+            config, request, turns, progress, streaming, emitter, true,
         )?;
     }
     Ok(())
@@ -1959,19 +2130,19 @@ fn active_interactive_session(turns: &[ToolTurn]) -> Option<ActiveInteractiveSes
     let mut active: Option<ActiveInteractiveSession> = None;
     for turn in turns {
         match turn.tool.as_str() {
-                "interactive_shell_start" => {
-                    let session_id = turn
-                        .result
-                        .output
-                        .get("session_id")
+            "interactive_shell_start" => {
+                let session_id = turn
+                    .result
+                    .output
+                    .get("session_id")
                     .and_then(Value::as_str)?
                     .to_string();
-                    active = Some(ActiveInteractiveSession {
-                        session_id,
-                        since_seq: 0,
-                        needs_observation: true,
-                    });
-                }
+                active = Some(ActiveInteractiveSession {
+                    session_id,
+                    since_seq: 0,
+                    needs_observation: true,
+                });
+            }
             "interactive_shell_write" => {
                 let session_id = turn
                     .args
@@ -2209,7 +2380,11 @@ fn tool_running_summary(tool: &str, args: &Value) -> String {
         "grep" => format!(
             "Searching {} for {}",
             compact_path(args.get("root").and_then(Value::as_str).unwrap_or(".")),
-            compact_text(args.get("pattern").and_then(Value::as_str).unwrap_or("text"))
+            compact_text(
+                args.get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or("text")
+            )
         ),
         "web_fetch" => format!(
             "Fetching {}",
@@ -2229,11 +2404,19 @@ fn tool_running_summary(tool: &str, args: &Value) -> String {
         ),
         "shell_exec" => format!(
             "Running {}",
-            compact_text(args.get("command").and_then(Value::as_str).unwrap_or("command"))
+            compact_text(
+                args.get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command")
+            )
         ),
         "interactive_shell_start" => format!(
             "Starting interactive shell for {}",
-            compact_text(args.get("command").and_then(Value::as_str).unwrap_or("command"))
+            compact_text(
+                args.get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command")
+            )
         ),
         "interactive_shell_read" => "Reading interactive shell output".into(),
         "interactive_shell_write" => format!(
@@ -2271,7 +2454,11 @@ fn tool_done_summary(tool: &str, args: &Value, result: &ToolCallResult) -> Strin
                 .cloned()
                 .unwrap_or_default();
             match matches.first().and_then(Value::as_str) {
-                Some(first) => format!("Found {} match(es); first: {}", matches.len(), compact_path(first)),
+                Some(first) => format!(
+                    "Found {} match(es); first: {}",
+                    matches.len(),
+                    compact_path(first)
+                ),
                 None => "No matches found".into(),
             }
         }
@@ -2282,7 +2469,11 @@ fn tool_done_summary(tool: &str, args: &Value, result: &ToolCallResult) -> Strin
                 .cloned()
                 .unwrap_or_default();
             match matches.first().and_then(Value::as_str) {
-                Some(first) => format!("Matched {} path(s); first: {}", matches.len(), compact_path(first)),
+                Some(first) => format!(
+                    "Matched {} path(s); first: {}",
+                    matches.len(),
+                    compact_path(first)
+                ),
                 None => "No matching paths".into(),
             }
         }
@@ -2297,7 +2488,10 @@ fn tool_done_summary(tool: &str, args: &Value, result: &ToolCallResult) -> Strin
                     "Found {} match(es); first: {}:{} {}",
                     matches.len(),
                     compact_path(first.get("path").and_then(Value::as_str).unwrap_or("file")),
-                    first.get("line").and_then(Value::as_u64).unwrap_or_default(),
+                    first
+                        .get("line")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
                     compact_text(first.get("text").and_then(Value::as_str).unwrap_or(""))
                 ),
                 None => "No text matches".into(),
@@ -2553,4 +2747,93 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatExecutionConfig, required_tool_use_reason, run_chat_execution};
+    use crate::context_builder::build_chat_base_prompt;
+    use crate::tooling::tool_definition_by_name;
+    use serde_json::json;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn direct_local_write_requests_force_a_concrete_tool_step() {
+        let working_directory = temp_dir("noodle-executor-write");
+        let input = "create a alex.md file and write alexander in binary 12 times";
+        let request = ChatExecutionConfig {
+            plugin: "chat".into(),
+            input: input.into(),
+            working_directory: working_directory.display().to_string(),
+            base_prompt: build_chat_base_prompt(
+                "",
+                input,
+                &working_directory.display().to_string(),
+                "zsh",
+                "",
+                None,
+                &[],
+            ),
+            memory_context: String::new(),
+            include_tool_context: false,
+            tool_calling_enabled: true,
+            task_execution_enabled: true,
+            max_tool_rounds: 4,
+            max_replans: 1,
+            available_tools: vec![tool_definition_by_name("file_write").unwrap()],
+        };
+        assert!(required_tool_use_reason(&request).is_some());
+
+        let responses = RefCell::new(VecDeque::from(vec![
+            "FINAL: I can write that file.".to_string(),
+            "FINAL: I need to inspect with tools before I can answer that confidently."
+                .to_string(),
+            r#"STEP: file_write {"path":"alex.md","content":"01100001\n01101100\n01100101\n01111000\n01100001\n01101110\n01100100\n01100101\n01110010\n01100001\n01101100\n01100101\n01111000\n01100001\n01101110\n01100100\n01100101\n01110010\n01100001\n01101100\n01100101\n01111000\n01100001\n01101110\n01100100\n01100101\n01110010\n01100001\n01101100\n01100101\n01111000\n01100001\n01101110\n01100100\n01100101\n01110010"}"#.to_string(),
+            "FINAL: wrote alex.md".to_string(),
+        ]));
+        let prompts = RefCell::new(Vec::new());
+        let config = json!({
+            "permissions": {
+                "classes": {
+                    "local_write": "allow"
+                }
+            }
+        });
+        let mut noop = |_action: &crate::actions::DaemonAction| Ok(());
+        let action = run_chat_execution(&config, request, false, &mut noop, &|prompt| {
+            prompts.borrow_mut().push(prompt.to_string());
+            responses
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| "missing stub response".to_string())
+        })
+        .unwrap();
+
+        let written = fs::read_to_string(working_directory.join("alex.md")).unwrap();
+        assert!(written.contains("01100001"));
+        assert_eq!(action.primary_text().as_deref(), Some("wrote alex.md"));
+        let prompts = prompts.borrow();
+        assert_eq!(prompts.len(), 4);
+        assert!(
+            prompts[1]
+                .contains("This request explicitly requires tool use before any final answer")
+        );
+        assert!(prompts[2].contains("You must choose a tool-based next action now."));
+
+        let _ = fs::remove_dir_all(&working_directory);
+    }
 }

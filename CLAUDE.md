@@ -22,7 +22,7 @@ Three pieces, one real plugin host:
 2. **Rust daemon + client** (`src/`) — single binary `noodle` that:
    - serves a Unix socket (`~/.noodle/noodle.sock`) as `noodle daemon`
    - runs an MCP stdio server as `noodle mcp`
-   - dispatches events to plugins (`chat`, `typos`) in configured order
+   - dispatches events to built-in plugins in configured order
    - owns model provider calls, memory, tool registry, permissions
    - streams live actions to the adapter during long-running work
 3. **Shared SQLite memory** at `~/.noodle/memory.db`, exposing three layers:
@@ -30,8 +30,9 @@ Three pieces, one real plugin host:
    - `state` (derived counters / fast lookups)
    - `artifacts` (compiled memory objects, incl. task records)
 
-Only two plugins ship today: `chat` and `typos`. Both are implemented inside
-the daemon binary itself — there is no out-of-process plugin API yet.
+Six built-in plugins ship today: `utils`, `memory`, `scripting`, `todo`,
+`chat`, and `typos`. They are all implemented inside the daemon binary itself
+— there is no out-of-process plugin API yet.
 
 ## Key modules
 
@@ -153,7 +154,7 @@ NOODLE_BYPASS_DAEMON=1 ./target/release/noodle tool-list \
 
 Config lives at `~/.noodle/config.json`; see `config/config.example.json`
 for the full shape (provider, `soul`, `runtime`, `permissions`, `memory`,
-`plugins.{chat,typos}` with `uses_tools`, `exports_tools`,
+`plugins.{utils,memory,scripting,todo,chat,typos}` with `uses_tools`, `exports_tools`,
 `tool_calling`, `task_execution`, `max_tool_rounds`, `max_replans`).
 
 ## Dependencies
