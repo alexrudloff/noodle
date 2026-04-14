@@ -433,7 +433,7 @@ def maybe_prompt_llm_settings(data, config_created):
 
     timeout_value = prompt_text("Timeout seconds", default=current_timeout)
     data["timeout_seconds"] = normalize_int(timeout_value, 30)
-    print(f"Configured noodle for provider={provider} model={data['model']}.")
+    print(f"Configuring noodle for provider={provider} model={data['model']}.")
 
 path = Path(sys.argv[1]).expanduser()
 config_created = sys.argv[2] == "1"
@@ -624,7 +624,7 @@ printf 'Launch agent: %s\n' "${launch_agent_plist}"
 printf 'Shell rc: %s\n' "${zshrc_path}"
 printf '\nSay hello to noodle with:\n'
 printf '%s' "${hello_style}"
-printf "oo hello! my name is %s\n" "${USER:-there}"
+printf 'oo hello! my name is <yourname>\n\n'
 printf '%s' "${reset_style}"
 printf 'type /help for additional commands\n'
 
@@ -635,4 +635,4 @@ if [[ "${NOODLE_INSTALL_SKIP_SHELL_RELOAD:-0}" != "1" ]] && { : </dev/tty >/dev/
 fi
 
 print
-print -- "Run 'exec zsh' to load noodle in this shell, then say: oo hello! my name is ${USER:-there}"
+print -- "Run 'exec zsh' to load noodle in this shell, then say: oo hello! my name is <yourname>"
