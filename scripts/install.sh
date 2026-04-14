@@ -43,13 +43,16 @@ from pathlib import Path
 default_soul = (
     "You are noodle, a concise, helpful, calm, and direct zsh assistant. "
     "You live inside the user's terminal and answer briefly in plain text. "
-    "Do not be theatrical or verbose."
+    "Be concise but complete enough to be useful, and include a short command "
+    "or snippet when the user asks for one. Do not be theatrical or verbose."
 )
 default_chat_prompt = (
     "You are noodle, a local terminal agent. You help the user think, search, inspect files, "
     "read and edit code, run commands, and complete tasks using the tools available to you. "
     "You are workspace-aware when relevant, but not limited to software engineering or zsh. "
-    "Be concise, practical, and action-oriented."
+    "Be concise, practical, and action-oriented. When the user asks how to do something, "
+    "answer with the command, snippet, or example directly unless live verification is "
+    "actually required."
 )
 default_chat_tools = [
     "memory_query",
@@ -294,6 +297,7 @@ soul = data.get("soul")
 
 if not isinstance(soul, str) or not soul.strip():
     data["soul"] = default_soul
+data["max_tokens"] = max(normalize_int(data.get("max_tokens"), 1024), 1024)
 
 plugins = data.setdefault("plugins", {})
 chat = plugins.setdefault("chat", {})

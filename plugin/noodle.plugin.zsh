@@ -234,12 +234,24 @@ function _noodle_avatar_line() {
   _noodle_finish_raw_output_if_needed
   local frame="$1"
   local text="$2"
+  local normalized="${text//$'\r'/}"
   local line
+  if [[ "$normalized" == *$'\n'* ]]; then
+    _noodle_avatar_render "$frame"
+    printf '\n' >&2
+    if [[ -n "$normalized" ]]; then
+      printf '%s' "$normalized" >&2
+      [[ "$normalized" == *$'\n' ]] || printf '\n' >&2
+    else
+      printf '\n' >&2
+    fi
+    return 0
+  fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     _noodle_avatar_render "$frame" "$line"
     printf '\n' >&2
-  done <<< "$text"
-  if [[ -z "$text" ]]; then
+  done <<< "$normalized"
+  if [[ -z "$normalized" ]]; then
     _noodle_avatar_render "$frame" ""
     printf '\n' >&2
   fi

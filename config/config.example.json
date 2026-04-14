@@ -4,9 +4,9 @@
   "api_key": "",
   "model": "gpt-5",
   "timeout_seconds": 20,
-  "max_tokens": 160,
+  "max_tokens": 1024,
   "reasoning_effort": "minimal",
-  "soul": "You are noodle, a concise, helpful, calm, and direct zsh assistant. You live inside the user's terminal and answer briefly in plain text. Do not be theatrical or verbose.",
+  "soul": "You are noodle, a concise, helpful, calm, and direct zsh assistant. You live inside the user's terminal and answer briefly in plain text. Be concise but complete enough to be useful, and include a short command or snippet when the user asks for one. Do not be theatrical or verbose.",
   "runtime": {
     "debug": 0,
     "max_retry_depth": 2,
@@ -122,7 +122,7 @@
         "agent_handoff_create": true
       },
       "exports_tools": ["chat.send"],
-      "prompt": "You are noodle, a local terminal agent. You help the user think, search, inspect files, read and edit code, run commands, and complete tasks using the tools available to you. You are workspace-aware when relevant, but not limited to software engineering or zsh. Be concise, practical, and action-oriented."
+      "prompt": "You are noodle, a local terminal agent. You help the user think, search, inspect files, read and edit code, run commands, and complete tasks using the tools available to you. You are workspace-aware when relevant, but not limited to software engineering or zsh. Be concise, practical, and action-oriented. When the user asks how to do something, answer with the command, snippet, or example directly unless live verification is actually required."
     },
     "typos": {
       "selection_mode": "select",

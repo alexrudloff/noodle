@@ -27,11 +27,12 @@ pub fn parse_planned_chat_step(raw: &str) -> PlannedChatStep {
         return PlannedChatStep::Plan(plan);
     }
 
+    if let Some(final_text) = parse_final_block(&cleaned) {
+        return PlannedChatStep::Final(final_text);
+    }
+
     for line in cleaned.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("FINAL:") {
-            return PlannedChatStep::Final(rest.trim().to_string());
-        }
         if let Some(rest) = trimmed.strip_prefix("TOOL:") {
             let rest = rest.trim();
             if let Some((name, args)) = split_tool_invocation(rest) {
@@ -47,6 +48,28 @@ pub fn parse_planned_chat_step(raw: &str) -> PlannedChatStep {
     }
 
     PlannedChatStep::Final(cleaned)
+}
+
+fn parse_final_block(text: &str) -> Option<String> {
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(rest) = line.strip_prefix("FINAL:") else {
+            continue;
+        };
+        let mut collected = vec![rest.trim().to_string()];
+        for next in lines.iter().skip(index + 1) {
+            if next.starts_with("FINAL:")
+                || next.starts_with("TOOL:")
+                || next.starts_with("STEP:")
+                || next.starts_with("PLAN:")
+            {
+                break;
+            }
+            collected.push((*next).to_string());
+        }
+        return Some(collected.join("\n").trim().to_string());
+    }
+    None
 }
 
 fn parse_plan_block(text: &str) -> Option<TaskPlan> {
@@ -130,6 +153,19 @@ mod tests {
                 );
             }
             other => panic!("expected interactive shell tool call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiline_final_keeps_following_lines() {
+        match parse_planned_chat_step(
+            "FINAL: Use:\nfind / -type f -iname 'README.md' 2>/dev/null\nThen put it in a script.",
+        ) {
+            PlannedChatStep::Final(text) => {
+                assert!(text.contains("find / -type f -iname 'README.md' 2>/dev/null"));
+                assert!(text.contains("Then put it in a script."));
+            }
+            other => panic!("expected final, got {other:?}"),
         }
     }
 }

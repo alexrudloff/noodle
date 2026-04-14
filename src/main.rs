@@ -2777,26 +2777,30 @@ fn call_openai_compatible(config: &Value, prompt: &str, debug: bool) -> Result<S
     let timeout = value_or_env(config, "NOODLE_TIMEOUT_SECONDS", "timeout_seconds", "20")
         .parse::<u64>()
         .unwrap_or(20);
-    let max_tokens = value_or_env(config, "NOODLE_MAX_TOKENS", "max_tokens", "160")
-        .parse::<u64>()
-        .unwrap_or(160);
+    let mut max_tokens = configured_max_tokens(config);
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
-    let payload = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_completion_tokens": max_tokens
-    });
-    let body = request_json(
-        &format!("{}/chat/completions", base_url.trim_end_matches('/')),
-        api_key.as_str(),
-        &payload,
-        timeout,
-        debug,
-    )?;
-    body.pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "empty model response".into())
+    for attempt in 0..3 {
+        let payload = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_completion_tokens": max_tokens
+        });
+        let body = request_json(&url, api_key.as_str(), &payload, timeout, debug)?;
+        let text = extract_openai_compatible_text(&body);
+        if !openai_compatible_response_was_truncated(&body) {
+            return text.ok_or_else(|| "empty model response".into());
+        }
+        if attempt == 2 {
+            return text.ok_or_else(|| {
+                "model response was truncated by max_completion_tokens and no text was returned"
+                    .into()
+            });
+        }
+        max_tokens = expanded_max_tokens(max_tokens);
+    }
+
+    Err("failed to obtain a complete model response".into())
 }
 
 fn call_openai_responses(config: &Value, prompt: &str, debug: bool) -> Result<String, String> {
@@ -2814,31 +2818,82 @@ fn call_openai_responses(config: &Value, prompt: &str, debug: bool) -> Result<St
     let timeout = value_or_env(config, "NOODLE_TIMEOUT_SECONDS", "timeout_seconds", "20")
         .parse::<u64>()
         .unwrap_or(20);
-    let max_tokens = value_or_env(config, "NOODLE_MAX_TOKENS", "max_tokens", "160")
-        .parse::<u64>()
-        .unwrap_or(160);
+    let mut max_tokens = configured_max_tokens(config);
     let reasoning_effort = value_or_env(config, "NOODLE_REASONING_EFFORT", "reasoning_effort", "");
+    let url = format!("{}/responses", base_url.trim_end_matches('/'));
 
-    let mut payload = json!({
-        "model": model,
-        "input": prompt,
-        "max_output_tokens": max_tokens,
-    });
-    if !reasoning_effort.is_empty() {
-        payload["reasoning"] = json!({ "effort": reasoning_effort });
+    for attempt in 0..3 {
+        let mut payload = json!({
+            "model": model,
+            "input": prompt,
+            "max_output_tokens": max_tokens,
+        });
+        if !reasoning_effort.is_empty() {
+            payload["reasoning"] = json!({ "effort": reasoning_effort });
+        }
+
+        let body = request_json(&url, api_key.as_str(), &payload, timeout, debug)?;
+        let text = extract_openai_responses_text(&body);
+        if !openai_responses_body_was_truncated(&body) {
+            if text.trim().is_empty() {
+                return Err(format!(
+                    "empty response body from OpenAI responses API: {body}"
+                ));
+            }
+            return Ok(text);
+        }
+        if attempt == 2 {
+            if !text.trim().is_empty() {
+                return Ok(text);
+            }
+            return Err(format!(
+                "response was truncated by max_output_tokens before any visible text was returned: {body}"
+            ));
+        }
+        max_tokens = expanded_max_tokens(max_tokens);
     }
 
-    let body = request_json(
-        &format!("{}/responses", base_url.trim_end_matches('/')),
-        api_key.as_str(),
-        &payload,
-        timeout,
-        debug,
-    )?;
+    Err("failed to obtain a complete model response".into())
+}
 
+const DEFAULT_MAX_TOKENS: u64 = 1024;
+const MAX_RETRY_MAX_TOKENS: u64 = 2048;
+
+fn configured_max_tokens(config: &Value) -> u64 {
+    value_or_env(
+        config,
+        "NOODLE_MAX_TOKENS",
+        "max_tokens",
+        &DEFAULT_MAX_TOKENS.to_string(),
+    )
+    .parse::<u64>()
+    .unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
+fn expanded_max_tokens(current: u64) -> u64 {
+    current
+        .saturating_mul(2)
+        .max(DEFAULT_MAX_TOKENS)
+        .min(MAX_RETRY_MAX_TOKENS)
+}
+
+fn extract_openai_compatible_text(body: &Value) -> Option<String> {
+    body.pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn openai_compatible_response_was_truncated(body: &Value) -> bool {
+    body.pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        == Some("length")
+}
+
+fn extract_openai_responses_text(body: &Value) -> String {
     if let Some(text) = body.get("output_text").and_then(Value::as_str) {
         if !text.trim().is_empty() {
-            return Ok(text.to_owned());
+            return text.to_owned();
         }
     }
 
@@ -2860,12 +2915,15 @@ fn call_openai_responses(config: &Value, prompt: &str, debug: bool) -> Result<St
             }
         }
     }
-    if pieces.is_empty() {
-        return Err(format!(
-            "empty response body from OpenAI responses API: {body}"
-        ));
-    }
-    Ok(pieces.join(""))
+    pieces.join("")
+}
+
+fn openai_responses_body_was_truncated(body: &Value) -> bool {
+    body.get("status").and_then(Value::as_str) == Some("incomplete")
+        && body
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("max_output_tokens")
 }
 
 fn call_anthropic(config: &Value, prompt: &str, debug: bool) -> Result<String, String> {
@@ -2883,9 +2941,7 @@ fn call_anthropic(config: &Value, prompt: &str, debug: bool) -> Result<String, S
     let timeout = value_or_env(config, "NOODLE_TIMEOUT_SECONDS", "timeout_seconds", "20")
         .parse::<u64>()
         .unwrap_or(20);
-    let max_tokens = value_or_env(config, "NOODLE_MAX_TOKENS", "max_tokens", "160")
-        .parse::<u64>()
-        .unwrap_or(160);
+    let max_tokens = configured_max_tokens(config);
     let payload = json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -3096,7 +3152,10 @@ fn encode_field(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{broader_local_roots_from_home, call_selector_stub};
+    use super::{
+        broader_local_roots_from_home, call_selector_stub, expanded_max_tokens,
+        openai_compatible_response_was_truncated, openai_responses_body_was_truncated,
+    };
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3161,5 +3220,36 @@ mod tests {
         );
         let response = call_selector_stub(&prompt).unwrap();
         assert_eq!(response, "FINAL: interactive shell completed.");
+    }
+
+    #[test]
+    fn responses_api_truncation_is_detected() {
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": {
+                "reason": "max_output_tokens"
+            }
+        });
+        assert!(openai_responses_body_was_truncated(&body));
+    }
+
+    #[test]
+    fn chat_completions_truncation_is_detected() {
+        let body = json!({
+            "choices": [
+                {
+                    "finish_reason": "length"
+                }
+            ]
+        });
+        assert!(openai_compatible_response_was_truncated(&body));
+    }
+
+    #[test]
+    fn max_token_retry_grows_to_useful_sizes() {
+        assert_eq!(expanded_max_tokens(160), 1024);
+        assert_eq!(expanded_max_tokens(512), 1024);
+        assert_eq!(expanded_max_tokens(1024), 2048);
+        assert_eq!(expanded_max_tokens(2048), 2048);
     }
 }

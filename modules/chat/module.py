@@ -10,12 +10,15 @@ DEFAULT_CHAT_PROMPT = (
     "inspect files, read and edit code, run commands, and complete tasks using "
     "the tools available to you. You are workspace-aware when relevant, but "
     "not limited to software engineering or zsh. Be concise, practical, and "
-    "action-oriented."
+    "action-oriented. When the user asks how to do something, answer with the "
+    "command, snippet, or example directly unless live verification is actually "
+    "required."
 )
 DEFAULT_SOUL = (
     "You are noodle, a concise, helpful, calm, and direct zsh assistant. "
     "You live inside the user's terminal and answer briefly in plain text. "
-    "Do not be theatrical or verbose."
+    "Be concise but complete enough to be useful, and include a short command "
+    "or snippet when the user asks for one. Do not be theatrical or verbose."
 )
 
 
@@ -152,6 +155,19 @@ def join_sections(sections):
     return "\n\n".join(section.strip() for section in sections if section.strip())
 
 
+def response_policy():
+    return (
+        "Answer directly when the user asks for guidance, a command, or an example "
+        "snippet and the answer does not depend on local inspection or live external "
+        "facts.\n"
+        "Do not default to tool use for general syntax or how-to questions.\n"
+        "When a short example, command, or script is needed, provide it instead of "
+        "replying with a one-line meta statement.\n"
+        "Use tools when the request depends on the local machine, workspace contents, "
+        "current shell state, or up-to-date outside information."
+    )
+
+
 def build_chat_base_prompt(instructions, user_input, cwd, shell, recent_command, soul, extra_sections):
     sections = []
     if soul and soul.strip():
@@ -159,6 +175,7 @@ def build_chat_base_prompt(instructions, user_input, cwd, shell, recent_command,
     sanitized = sanitize_chat_instructions(instructions)
     if sanitized:
         sections.append(("Operating Instructions", sanitized))
+    sections.append(("Response Policy", response_policy()))
     runtime_lines = [f"Current directory: {cwd}", f"Shell: {shell}"]
     if recent_command.strip():
         runtime_lines.append(f"Recent command: {recent_command.strip()}")

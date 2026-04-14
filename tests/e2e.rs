@@ -1030,6 +1030,40 @@ fn chat_rechecks_a_bad_direct_answer_with_tools() {
 }
 
 #[test]
+fn chat_recovers_from_meta_tool_reply_for_guidance_request() {
+    let temp = TempDir::new("noodle-e2e-guidance-recovery");
+    let config = write_test_config(&temp, "auto");
+    prepend_stub_matchers(
+        &config,
+        vec![
+            json!({
+                "contains": "[Task Directive]\nYou must produce a useful answer now.\nReason: The user asked for guidance or an example command/script, not for you to inspect or execute anything on their behalf.",
+                "response": "FINAL: Use:\nfind / -type f -iname 'README.md' 2>/dev/null\nPut that in a script like find-readmes.sh and run chmod +x find-readmes.sh."
+            }),
+            json!({
+                "contains": "[Task Directive]\nYou previously drafted a direct answer before using any tools.\nDraft answer:\nI need to inspect with tools before I can answer that confidently.",
+                "response": "FINAL: I still need to inspect my tools."
+            }),
+            json!({
+                "contains": "[Current Request]\nhow do i write a bash script to find every readme.md file on my entire computer?",
+                "response": "FINAL: I need to inspect with tools before I can answer that confidently."
+            }),
+        ],
+    );
+    let result = run_mode(
+        &temp,
+        &config,
+        "command_not_found",
+        "oo how do i write a bash script to find every readme.md file on my entire computer?",
+        None,
+    );
+    assert_eq!(result["action"], "message");
+    let message = result["message"].as_str().unwrap_or("");
+    assert!(message.contains("find / -type f -iname 'README.md' 2>/dev/null"));
+    assert!(!message.contains("inspect with tools"));
+}
+
+#[test]
 fn chat_refuses_recursive_noodle_invocation_and_recovers() {
     let temp = TempDir::new("noodle-e2e-recursive-shell-guard");
     let config = write_test_config(&temp, "auto");
@@ -1793,6 +1827,73 @@ fn zsh_streams_simple_tool_steps_live() {
         output.contains("## What is noodle?")
             || output.contains("A local-first terminal companion for `zsh`."),
         "expected raw file content, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn zsh_renders_multiline_messages_as_a_single_avatar_block() {
+    let temp = TempDir::new("noodle-zsh-multiline-block");
+    let config = write_test_config(&temp, "auto");
+    fs::write(
+        temp.path().join("README.md"),
+        "#!/usr/bin/env bash\necho alpha\necho beta",
+    )
+    .unwrap();
+
+    let script = format!(
+        "cd '{}'; oo what does readme.md say\\?",
+        temp.path().display()
+    );
+    let output = run_zsh(&temp, &config, &script);
+    assert!(
+        output.contains("oo\n#!/usr/bin/env bash\necho alpha\necho beta"),
+        "expected multiline block rendering, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("oo\techo alpha") && !output.contains("oo\techo beta"),
+        "expected subsequent lines without avatar prefix, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn zsh_renders_multiline_slash_command_messages_as_single_avatar_blocks() {
+    let temp = TempDir::new("noodle-zsh-slash-multiline-blocks");
+    let config = write_test_config(&temp, "auto");
+
+    let output = run_zsh(
+        &temp,
+        &config,
+        "_noodle_dispatch_explicit_input '/help'; _noodle_dispatch_explicit_input '/memory help'; _noodle_dispatch_explicit_input '/todo help'; _noodle_dispatch_explicit_input '/kv help'",
+    );
+    assert!(
+        output.contains("oo\nSlash commands:\n/help - Show available slash commands"),
+        "expected utils multiline block rendering, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("oo\nMemory commands:\n/memory\n/memory help"),
+        "expected memory multiline block rendering, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("oo\nTodo commands:\n/todo list\n/todo add <task>"),
+        "expected todo multiline block rendering, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("oo\nScripting commands:\n/kv help\n/kv get <key>"),
+        "expected scripting multiline block rendering, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains("oo\t/memory")
+            && !output.contains("oo\t/todo")
+            && !output.contains("oo\t/kv")
+            && !output.contains("oo\t/help"),
+        "expected slash command bodies without repeated avatar prefixes, got:\n{}",
         output
     );
 }

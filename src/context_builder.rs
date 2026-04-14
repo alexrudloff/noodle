@@ -38,8 +38,12 @@ pub enum TaskDirectiveContext {
     VerifyDirectAnswer {
         draft_answer: String,
         required_tool_use_reason: Option<String>,
+        direct_guidance_reason: Option<String>,
     },
     ForceToolChoice {
+        reason: String,
+    },
+    ForceDirectAnswer {
         reason: String,
     },
     Replan {
@@ -108,6 +112,11 @@ pub fn build_chat_base_prompt(
             body: instructions,
         });
     }
+
+    sections.push(PromptSection {
+        title: "Response Policy",
+        body: response_policy_block(),
+    });
 
     sections.push(PromptSection {
         title: "Runtime Context",
@@ -223,6 +232,9 @@ Rules:\n\
 - For requests to locate a local file or folder by name, prefer path_search first.\n\
 - Do not claim a local file or directory is missing until you have checked with tools.\n\
 - Prefer local workspace tools for local file and repository tasks.\n\
+- When the user asks how to do something, what command to use, or asks for an example script or snippet, answer directly with the command or snippet unless local inspection or live external facts are actually required.\n\
+- For guidance-style requests, do not answer with a meta statement about needing tools or needing to inspect your tools unless that verification is genuinely necessary.\n\
+- For instructional answers, stay concise but complete enough to be useful. A short paragraph plus a command or snippet is better than an empty one-line reply.\n\
 - For requests to locate named files, folders, worktrees, branches, or personal artifacts, do not assume the current workspace is the only relevant scope.\n\
 - If the target may live outside the current workspace, search the broader local roots shown in context before concluding it is missing.\n\
 - Prefer web tools only when the task needs outside or current information.\n\
@@ -366,6 +378,7 @@ fn render_task_directive(directive: TaskDirectiveContext) -> String {
         TaskDirectiveContext::VerifyDirectAnswer {
             draft_answer,
             required_tool_use_reason,
+            direct_guidance_reason,
         } => {
             let mut directive = format!(
                 "You previously drafted a direct answer before using any tools.\n\
@@ -384,6 +397,18 @@ PLAN: <short summary>\n\
 Do not answer the user directly in this pass.",
                 draft_answer
             );
+            if let Some(reason) = direct_guidance_reason.filter(|value| !value.trim().is_empty()) {
+                directive.push_str(&format!(
+                    "\n- This request is asking for guidance rather than asking you to perform the task: {}",
+                    reason
+                ));
+                directive.push_str(
+                    "\n- If no verification is actually required, the eventual final answer should directly provide the command, snippet, or explanation the user asked for."
+                );
+                directive.push_str(
+                    "\n- A meta reply like \"I need to inspect with tools first\" is not an acceptable final answer for this request."
+                );
+            }
             if let Some(reason) = required_tool_use_reason.filter(|value| !value.trim().is_empty())
             {
                 directive.push_str(&format!(
@@ -403,6 +428,18 @@ TOOL: <tool_name> <json arguments>\n\
 STEP: <tool_name> <json arguments>\n\
 PLAN: <short summary>\n\
 Do not reply with FINAL or FINAL_OK.",
+            reason
+        ),
+        TaskDirectiveContext::ForceDirectAnswer { reason } => format!(
+            "You must produce a useful answer now.\nReason: {}\n\
+If the answer does not depend on local inspection or live external facts, reply with:\n\
+FINAL: <plain text response>\n\
+Include the command, snippet, or explanation the user asked for.\n\
+Do not reply with a meta statement about needing tools, needing to inspect your tools, or needing more confidence.\n\
+If verification is actually required, reply with exactly one of:\n\
+TOOL: <tool_name> <json arguments>\n\
+STEP: <tool_name> <json arguments>\n\
+PLAN: <short summary>",
             reason
         ),
         TaskDirectiveContext::Replan {
@@ -456,6 +493,10 @@ fn render_tool_catalog(tools: &[ToolDefinition]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn response_policy_block() -> String {
+    "Answer directly when the user asks for guidance, a command, or an example snippet and the answer does not depend on local inspection or live external facts.\nDo not default to tool use for general syntax or how-to questions.\nWhen a short example, command, or script is needed, provide it instead of replying with a one-line meta statement.\nUse tools when the request depends on the local machine, workspace contents, current shell state, or up-to-date outside information.".to_string()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -578,6 +619,8 @@ mod tests {
         assert!(prompt.contains("You are noodle."));
         assert!(!prompt.contains("{user_input}"));
         assert!(!prompt.contains("Question:"));
+        assert!(prompt.contains("[Response Policy]"));
+        assert!(prompt.contains("Answer directly when the user asks for guidance"));
         assert!(prompt.contains("[Runtime Context]"));
         assert!(prompt.contains("Current directory: /tmp/demo"));
         assert!(prompt.contains("[Workspace Context]"));

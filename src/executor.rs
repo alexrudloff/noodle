@@ -705,6 +705,7 @@ fn verify_direct_final(
     }
 
     let required_tool_use_reason = required_tool_use_reason(request);
+    let direct_guidance_reason = direct_guidance_reason(request);
     let prompt = build_chat_execution_prompt(
         &request.base_prompt,
         &request.memory_context,
@@ -715,13 +716,30 @@ fn verify_direct_final(
         Some(TaskDirectiveContext::VerifyDirectAnswer {
             draft_answer: direct_text.clone(),
             required_tool_use_reason: required_tool_use_reason.clone(),
+            direct_guidance_reason: direct_guidance_reason.clone(),
         }),
     );
     let verification_raw = model_output(&prompt)?;
     let verification = clean_text(&verification_raw);
     if verification.eq_ignore_ascii_case("FINAL_OK") {
-        if let Some(reason) = required_tool_use_reason {
+        if let Some(reason) = required_tool_use_reason.clone() {
             return force_tool_choice_after_direct_final(
+                config,
+                request,
+                turns,
+                remaining_rounds,
+                progress,
+                streaming,
+                emitter,
+                reason,
+                model_output,
+            );
+        }
+        if let Some(reason) = direct_guidance_reason
+            .clone()
+            .filter(|_| response_is_unhelpful_guidance_reply(&direct_text))
+        {
+            return force_direct_answer_after_direct_final(
                 config,
                 request,
                 turns,
@@ -744,9 +762,32 @@ fn verify_direct_final(
     }
 
     match parse_planned_chat_step(&verification_raw) {
-        PlannedChatStep::Final(_) => {
-            if let Some(reason) = required_tool_use_reason {
+        PlannedChatStep::Final(text) => {
+            if let Some(reason) = required_tool_use_reason.clone() {
                 return force_tool_choice_after_direct_final(
+                    config,
+                    request,
+                    turns,
+                    remaining_rounds,
+                    progress,
+                    streaming,
+                    emitter,
+                    reason,
+                    model_output,
+                );
+            }
+            if let Some(reason) = direct_guidance_reason {
+                if !response_is_unhelpful_guidance_reply(&text) {
+                    return Ok(finalize_action(
+                        progress,
+                        DaemonAction::Message {
+                            plugin: request.plugin.clone(),
+                            message: text,
+                        },
+                        streaming,
+                    ));
+                }
+                return force_direct_answer_after_direct_final(
                     config,
                     request,
                     turns,
@@ -888,6 +929,90 @@ fn verify_direct_final(
     }
 }
 
+fn force_direct_answer_after_direct_final(
+    config: &Value,
+    request: &ChatExecutionConfig,
+    turns: Vec<ToolTurn>,
+    remaining_rounds: usize,
+    progress: Vec<DaemonAction>,
+    streaming: bool,
+    emitter: &mut dyn FnMut(&DaemonAction) -> Result<(), String>,
+    reason: String,
+    model_output: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<DaemonAction, String> {
+    let turn_contexts = tool_turn_contexts(&turns);
+    let prompt = build_chat_execution_prompt(
+        &request.base_prompt,
+        &request.memory_context,
+        &request.available_tools,
+        request.include_tool_context,
+        request.tool_calling_enabled,
+        &turn_contexts,
+        Some(TaskDirectiveContext::ForceDirectAnswer {
+            reason: reason.clone(),
+        }),
+    );
+    let forced_raw = model_output(&prompt)?;
+    match parse_planned_chat_step(&forced_raw) {
+        PlannedChatStep::Final(text) => {
+            if response_is_unhelpful_guidance_reply(&text) {
+                return Ok(finalize_action(
+                    progress,
+                    DaemonAction::Ask {
+                        plugin: request.plugin.clone(),
+                        question: reason,
+                    },
+                    streaming,
+                ));
+            }
+            Ok(finalize_action(
+                progress,
+                DaemonAction::Message {
+                    plugin: request.plugin.clone(),
+                    message: text,
+                },
+                streaming,
+            ))
+        }
+        PlannedChatStep::Tool(step) => continue_tool_loop_with_step(
+            config,
+            request,
+            turns,
+            progress,
+            remaining_rounds,
+            streaming,
+            emitter,
+            model_output,
+            step,
+        ),
+        PlannedChatStep::Plan(plan) => {
+            if !request.task_execution_enabled {
+                return Ok(finalize_action(
+                    progress,
+                    DaemonAction::Ask {
+                        plugin: request.plugin.clone(),
+                        question:
+                            "That request needs multi-step planning, but task execution is disabled."
+                                .into(),
+                    },
+                    streaming,
+                ));
+            }
+            execute_plan(
+                config,
+                request,
+                plan,
+                turns,
+                request.max_replans,
+                progress,
+                streaming,
+                emitter,
+                model_output,
+            )
+        }
+    }
+}
+
 fn force_tool_choice_after_direct_final(
     config: &Value,
     request: &ChatExecutionConfig,
@@ -956,6 +1081,19 @@ fn force_tool_choice_after_direct_final(
             streaming,
         )),
     }
+}
+
+fn response_is_unhelpful_guidance_reply(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lowered = trimmed.to_lowercase();
+    (lowered.contains("need to inspect") && lowered.contains("tool"))
+        || (lowered.contains("need to use") && lowered.contains("tool"))
+        || lowered.contains("inspect with tools before i can answer")
+        || lowered.contains("need to inspect my tools")
+        || lowered.contains("before i can answer that confidently")
 }
 
 fn request_explicitly_wants_exact_output(input: &str) -> bool {
@@ -1061,6 +1199,38 @@ fn required_tool_use_reason(request: &ChatExecutionConfig) -> Option<String> {
     if has_write_tool && request_likely_needs_local_write(&request.input) {
         return Some(
             "The user asked you to create or modify a local file, so you must choose a local write tool before responding."
+                .into(),
+        );
+    }
+    None
+}
+
+fn request_prefers_direct_guidance(input: &str) -> bool {
+    let text = input.to_lowercase();
+    [
+        "how do i",
+        "how to",
+        "what command",
+        "show me the command",
+        "which command",
+        "example command",
+        "show me a script",
+        "example script",
+        "bash script to",
+        "shell script to",
+        "write a bash script",
+        "write me a bash script",
+        "regex to",
+        "sql query to",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn direct_guidance_reason(request: &ChatExecutionConfig) -> Option<String> {
+    if request_prefers_direct_guidance(&request.input) {
+        return Some(
+            "The user asked for guidance or an example command/script, not for you to inspect or execute anything on their behalf."
                 .into(),
         );
     }
@@ -2600,11 +2770,30 @@ fn clean_text(text: &str) -> String {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
-    let finals = cleaned
-        .iter()
-        .filter_map(|line| line.strip_prefix("FINAL:").map(str::trim))
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
+    let mut finals = Vec::new();
+    let mut index = 0;
+    while index < cleaned.len() {
+        let line = cleaned[index];
+        let Some(rest) = line.strip_prefix("FINAL:") else {
+            index += 1;
+            continue;
+        };
+        let mut block = vec![rest.trim().to_string()];
+        index += 1;
+        while index < cleaned.len() {
+            let next = cleaned[index];
+            if next.starts_with("FINAL:")
+                || next.starts_with("STEP:")
+                || next.starts_with("TOOL:")
+                || next.starts_with("PLAN:")
+            {
+                break;
+            }
+            block.push(next.to_string());
+            index += 1;
+        }
+        finals.push(block.join("\n").trim().to_string());
+    }
     if !finals.is_empty() {
         return finals.join("\n");
     }
@@ -2833,6 +3022,70 @@ mod tests {
                 .contains("This request explicitly requires tool use before any final answer")
         );
         assert!(prompts[2].contains("You must choose a tool-based next action now."));
+
+        let _ = fs::remove_dir_all(&working_directory);
+    }
+
+    #[test]
+    fn guidance_requests_recover_from_tool_meta_replies() {
+        let working_directory = temp_dir("noodle-executor-guidance");
+        let input =
+            "how do i write a bash script to find every readme.md file on my entire computer?";
+        let request = ChatExecutionConfig {
+            plugin: "chat".into(),
+            input: input.into(),
+            working_directory: working_directory.display().to_string(),
+            base_prompt: build_chat_base_prompt(
+                "",
+                input,
+                &working_directory.display().to_string(),
+                "zsh",
+                "",
+                None,
+                &[],
+            ),
+            memory_context: String::new(),
+            include_tool_context: false,
+            tool_calling_enabled: true,
+            task_execution_enabled: true,
+            max_tool_rounds: 4,
+            max_replans: 1,
+            available_tools: vec![tool_definition_by_name("shell_exec").unwrap()],
+        };
+
+        let responses = RefCell::new(VecDeque::from(vec![
+            "FINAL: I need to inspect with tools before I can answer that confidently."
+                .to_string(),
+            "FINAL: I still need to inspect my tools.".to_string(),
+            "FINAL: Use:\nfind / -type f -iname 'README.md' 2>/dev/null\nIf you want a reusable script, put that command in a .sh file and make it executable with chmod +x."
+                .to_string(),
+        ]));
+        let prompts = RefCell::new(Vec::new());
+        let config = json!({});
+        let mut noop = |_action: &crate::actions::DaemonAction| Ok(());
+        let action = run_chat_execution(&config, request, false, &mut noop, &|prompt| {
+            prompts.borrow_mut().push(prompt.to_string());
+            responses
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| "missing stub response".to_string())
+        })
+        .unwrap();
+
+        assert!(
+            action
+                .primary_text()
+                .as_deref()
+                .unwrap_or("")
+                .contains("find / -type f -iname 'README.md'"),
+            "expected direct guidance reply, got {action:?}"
+        );
+        let prompts = prompts.borrow();
+        assert_eq!(prompts.len(), 3);
+        assert!(
+            prompts[1].contains("A meta reply like \"I need to inspect with tools first\" is not an acceptable final answer for this request.")
+        );
+        assert!(prompts[2].contains("You must produce a useful answer now."));
 
         let _ = fs::remove_dir_all(&working_directory);
     }
