@@ -599,6 +599,14 @@ EOF
 "${launchctl_bin}" bootstrap "${launchctl_domain}" "${launch_agent_plist}"
 "${launchctl_bin}" kickstart -k "${launchctl_domain}/${launch_agent_label}" >/dev/null 2>&1 || true
 
+if [[ -t 1 ]]; then
+  hello_style=$'\033[1;97m'
+  reset_style=$'\033[0m'
+else
+  hello_style=''
+  reset_style=''
+fi
+
 cat <<'EOF'
 Installed noodle.
 
@@ -615,7 +623,10 @@ printf '\nInstalled files at: %s\n' "${install_root}"
 printf 'Launch agent: %s\n' "${launch_agent_plist}"
 printf 'Shell rc: %s\n' "${zshrc_path}"
 printf '\nSay hello to noodle with:\n'
+printf '%s' "${hello_style}"
 printf "oo hello! my name is %s\n" "${USER:-there}"
+printf '%s' "${reset_style}"
+printf 'type /help for additional commands\n'
 
 if [[ "${NOODLE_INSTALL_SKIP_SHELL_RELOAD:-0}" != "1" ]] && { : </dev/tty >/dev/tty; } 2>/dev/null; then
   print
