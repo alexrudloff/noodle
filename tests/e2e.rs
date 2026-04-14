@@ -1117,6 +1117,14 @@ fn utils_slash_commands_work_through_daemon() {
     let help = run_mode(&temp, &config, "slash_command", "/help", None);
     let help_text = help["message"].as_str().unwrap_or_default();
     assert!(
+        help_text.contains("Talk to noodle with: oo <whatever>"),
+        "{help}"
+    );
+    assert!(
+        help_text.contains("Example: oo how do I find every README.md file?"),
+        "{help}"
+    );
+    assert!(
         help_text.contains("/help - Show available slash commands"),
         "{help}"
     );
@@ -2502,7 +2510,9 @@ fn zsh_renders_multiline_slash_command_messages_as_single_avatar_blocks() {
         "_noodle_dispatch_explicit_input '/help'; _noodle_dispatch_explicit_input '/memory help'; _noodle_dispatch_explicit_input '/todo help'; _noodle_dispatch_explicit_input '/kv help'",
     );
     assert!(
-        output.contains("oo\nSlash commands:\n/help - Show available slash commands"),
+        output.contains(
+            "oo\nTalk to noodle with: oo <whatever>\nExample: oo how do I find every README.md file?\n\nSlash commands:\n/help - Show available slash commands"
+        ),
         "expected utils multiline block rendering, got:\n{}",
         output
     );

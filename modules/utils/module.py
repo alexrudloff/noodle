@@ -223,7 +223,12 @@ def save_config_document(path, value):
 
 
 def render_help(request):
-    lines = ["Slash commands:"]
+    lines = [
+        "Talk to noodle with: oo <whatever>",
+        "Example: oo how do I find every README.md file?",
+        "",
+        "Slash commands:",
+    ]
     for definition in request.get("host", {}).get("slash_commands", []):
         lines.append(f"/{definition['name']} - {definition['description']}")
         lines.append(f"  {definition['usage']}")
