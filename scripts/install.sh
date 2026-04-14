@@ -200,6 +200,15 @@ def prompting_available():
     return PROMPT_INPUT.isatty() and PROMPT_OUTPUT.isatty()
 
 
+def disable_focus_reporting():
+    if not prompting_available():
+        return
+    try:
+        print("\x1b[?1004l", end="", file=PROMPT_OUTPUT, flush=True)
+    except OSError:
+        pass
+
+
 def prompt_readline(prompt):
     print(prompt, end="", file=PROMPT_OUTPUT, flush=True)
     value = PROMPT_INPUT.readline()
@@ -367,6 +376,7 @@ def maybe_prompt_llm_settings(data, config_created):
         return
     if not prompting_available():
         return
+    disable_focus_reporting()
 
     current_provider = nested_get(data, "provider", "openai_responses")
     provider = prompt_choice(

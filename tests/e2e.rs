@@ -859,6 +859,12 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
     assert!(install_root.join("modules").exists());
     assert!(install_root.join("scripts/install.sh").exists());
     assert!(install_root.join("scripts/uninstall.sh").exists());
+    let installed_script = fs::read_to_string(install_root.join("scripts/install.sh")).unwrap();
+    assert!(
+        installed_script.contains("\\x1b[?1004l"),
+        "{}",
+        installed_script
+    );
     assert!(home.join("Library/LaunchAgents/com.noodle.daemon.plist").exists());
     let launchctl_calls = fs::read_to_string(&launchctl_log).unwrap();
     assert!(
