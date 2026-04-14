@@ -1,7 +1,73 @@
 #!/bin/zsh
 set -euo pipefail
 
-repo_root="${0:A:h:h}"
+function _noodle_install_is_repo_root() {
+  local candidate="${1:-}"
+  [[ -n "${candidate}" ]] || return 1
+  [[ -f "${candidate}/Cargo.toml" ]] || return 1
+  [[ -d "${candidate}/plugin" ]] || return 1
+  [[ -d "${candidate}/config" ]] || return 1
+  [[ -d "${candidate}/modules" ]] || return 1
+}
+
+function _noodle_install_require_command() {
+  local command_name="${1:-}"
+  command -v "${command_name}" >/dev/null 2>&1 || {
+    print -u2 -- "noodle install error: required command not found: ${command_name}"
+    exit 1
+  }
+}
+
+typeset -g NOODLE_INSTALL_BOOTSTRAP_DIR=""
+typeset -g repo_root=""
+
+function _noodle_install_cleanup() {
+  [[ -n "${NOODLE_INSTALL_BOOTSTRAP_DIR}" ]] || return 0
+  rm -rf "${NOODLE_INSTALL_BOOTSTRAP_DIR}"
+}
+
+function _noodle_install_resolve_repo_root() {
+  local script_path="${0:A}"
+  local candidate=""
+  if [[ -f "${script_path}" ]]; then
+    candidate="${script_path:h:h}"
+    if _noodle_install_is_repo_root "${candidate}"; then
+      repo_root="${candidate:A}"
+      return 0
+    fi
+  fi
+
+  local repo_slug="${NOODLE_INSTALL_REPO_SLUG:-alexrudloff/noodle}"
+  local ref="${NOODLE_INSTALL_REF:-main}"
+  local archive_url="${NOODLE_INSTALL_ARCHIVE_URL:-https://codeload.github.com/${repo_slug}/tar.gz/${ref}}"
+  local archive_path
+  local -a extracted_dirs
+
+  _noodle_install_require_command curl
+  _noodle_install_require_command tar
+  NOODLE_INSTALL_BOOTSTRAP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/noodle-install.XXXXXX")"
+  archive_path="${NOODLE_INSTALL_BOOTSTRAP_DIR}/source.tar.gz"
+
+  print -u2 -- "Fetching noodle source from ${archive_url}"
+  curl -fsSL "${archive_url}" -o "${archive_path}"
+  tar -xzf "${archive_path}" -C "${NOODLE_INSTALL_BOOTSTRAP_DIR}"
+  extracted_dirs=("${NOODLE_INSTALL_BOOTSTRAP_DIR}"/*(/N))
+  if (( ${#extracted_dirs} != 1 )); then
+    print -u2 -- "noodle install error: expected a single extracted source directory from ${archive_url}"
+    exit 1
+  fi
+  candidate="${extracted_dirs[1]}"
+  if ! _noodle_install_is_repo_root "${candidate}"; then
+    print -u2 -- "noodle install error: downloaded archive does not contain a valid noodle source tree"
+    exit 1
+  fi
+  repo_root="${candidate:A}"
+}
+
+_noodle_install_resolve_repo_root
+if [[ -n "${NOODLE_INSTALL_BOOTSTRAP_DIR}" ]]; then
+  trap _noodle_install_cleanup EXIT INT TERM
+fi
 install_root="${NOODLE_INSTALL_ROOT:-${HOME}/.noodle}"
 install_root="${install_root:A}"
 launch_agent_label="com.noodle.daemon"
@@ -70,6 +136,9 @@ default_chat_tools = [
     "interactive_shell_write",
     "interactive_shell_key",
     "interactive_shell_close",
+    "mcp_tools_list",
+    "mcp_tool_call",
+    "mcp_resources_list",
     "mcp_resource_read",
     "task_note_write",
     "agent_handoff_create",
@@ -99,6 +168,30 @@ provider_defaults = {
         "reasoning_effort": "",
     },
 }
+
+
+def resolve_prompt_streams():
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return sys.stdin, sys.stdout
+    try:
+        return open("/dev/tty", "r"), open("/dev/tty", "w")
+    except OSError:
+        return sys.stdin, sys.stdout
+
+
+PROMPT_INPUT, PROMPT_OUTPUT = resolve_prompt_streams()
+
+
+def prompting_available():
+    return PROMPT_INPUT.isatty() and PROMPT_OUTPUT.isatty()
+
+
+def prompt_readline(prompt):
+    print(prompt, end="", file=PROMPT_OUTPUT, flush=True)
+    value = PROMPT_INPUT.readline()
+    if not value:
+        return ""
+    return value.rstrip("\n")
 
 
 def nested_get(root, dotted_key, default=None):
@@ -160,7 +253,7 @@ def apply_install_overrides(data):
 def prompt_yes_no(question, default):
     suffix = "Y/n" if default else "y/N"
     while True:
-        answer = input(f"{question} [{suffix}]: ").strip().lower()
+        answer = prompt_readline(f"{question} [{suffix}]: ").strip().lower()
         if not answer:
             return default
         if answer in {"y", "yes"}:
@@ -170,12 +263,12 @@ def prompt_yes_no(question, default):
 
 
 def prompt_choice(question, options, default_key):
-    print(question)
+    print(question, file=PROMPT_OUTPUT)
     for index, (key, label) in enumerate(options, start=1):
         marker = " (default)" if key == default_key else ""
-        print(f"  {index}. {label}{marker}")
+        print(f"  {index}. {label}{marker}", file=PROMPT_OUTPUT)
     while True:
-        answer = input("Choose a provider: ").strip()
+        answer = prompt_readline("Choose a provider: ").strip()
         if not answer:
             return default_key
         if answer.isdigit():
@@ -191,7 +284,7 @@ def prompt_text(question, default=None, secret=False, allow_empty=True):
     prompt = f"{question}: "
     if default not in (None, ""):
         prompt = f"{question} [{default}]: "
-    value = getpass(prompt) if secret else input(prompt)
+    value = getpass(prompt, stream=PROMPT_OUTPUT) if secret else prompt_readline(prompt)
     value = value.strip()
     if value:
         return value
@@ -213,7 +306,7 @@ def maybe_prompt_llm_settings(data, config_created):
     mode = os.environ.get("NOODLE_INSTALL_CONFIGURE_LLM", "auto").strip().lower()
     if mode in {"0", "false", "no", "off"}:
         return
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not prompting_available():
         return
 
     should_prompt = config_created

@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 use serde_json::json;
+use std::env;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -721,6 +722,14 @@ fn strip_ansi(input: &str) -> String {
     out.replace('\r', "")
 }
 
+#[cfg(unix)]
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
 #[test]
 fn chat_works_through_oo_alias_end_to_end() {
     let temp = TempDir::new("noodle-e2e-chat");
@@ -730,6 +739,123 @@ fn chat_works_through_oo_alias_end_to_end() {
         output.contains("chat-ok"),
         "expected chat response, got:\n{}",
         output
+    );
+}
+
+#[test]
+fn installer_bootstraps_from_archive_when_piped_over_curl() {
+    let temp = TempDir::new("noodle-installer-bootstrap");
+    let home = temp.path().join("home");
+    let install_root = temp.path().join("install-root");
+    let fake_bin = temp.path().join("fake-bin");
+    let archive_root = temp.path().join("archive-src");
+    let repo_root = archive_root.join("noodle-main");
+    let archive_path = temp.path().join("noodle-main.tar.gz");
+
+    fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
+    fs::create_dir_all(&install_root).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(repo_root.join("scripts")).unwrap();
+    fs::create_dir_all(repo_root.join("plugin")).unwrap();
+    fs::create_dir_all(repo_root.join("config")).unwrap();
+    fs::create_dir_all(repo_root.join("modules")).unwrap();
+    fs::write(repo_root.join("Cargo.toml"), "[package]\nname = \"noodle\"\n").unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"),
+        repo_root.join("scripts/install.sh"),
+    )
+    .unwrap();
+    fs::write(
+        repo_root.join("plugin/noodle.plugin.zsh"),
+        "echo noodle-plugin-placeholder\n",
+    )
+    .unwrap();
+    fs::write(repo_root.join("config/config.example.json"), "{}\n").unwrap();
+    fs::write(repo_root.join("modules/.keep"), "").unwrap();
+
+    write_executable(
+        &fake_bin.join("cargo"),
+        "#!/bin/sh\nset -eu\nif [ \"$1\" = \"build\" ] && [ \"$2\" = \"--release\" ]; then\n  mkdir -p target/release\n  printf '#!/bin/sh\\nexit 0\\n' > target/release/noodle\n  chmod +x target/release/noodle\n  exit 0\nfi\nprintf 'unexpected cargo args: %s\\n' \"$*\" >&2\nexit 1\n",
+    );
+    write_executable(&fake_bin.join("codesign"), "#!/bin/sh\nexit 0\n");
+    write_executable(&fake_bin.join("launchctl"), "#!/bin/sh\nexit 0\n");
+
+    let tar_status = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&archive_root)
+        .arg("noodle-main")
+        .status()
+        .unwrap();
+    assert!(tar_status.success(), "failed to build installer archive");
+
+    let path_env = format!(
+        "{}:{}",
+        fake_bin.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let install_script_url = format!("file://{}", repo_root.join("scripts/install.sh").display());
+    let archive_url = format!("file://{}", archive_path.display());
+    let output = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg("curl -fsSL \"$INSTALL_SCRIPT_URL\" | zsh")
+        .env("HOME", &home)
+        .env("PATH", path_env)
+        .env("INSTALL_SCRIPT_URL", install_script_url)
+        .env("NOODLE_INSTALL_ARCHIVE_URL", archive_url)
+        .env("NOODLE_INSTALL_ROOT", &install_root)
+        .env("NOODLE_INSTALL_CONFIGURE_LLM", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "installer failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Installed noodle."),
+        "expected installer success output, got:\n{}",
+        combined
+    );
+    assert!(install_root.join("bin/noodle").exists());
+    assert!(install_root.join("plugin/noodle.plugin.zsh").exists());
+    assert!(install_root.join("config/config.example.json").exists());
+    assert!(install_root.join("modules").exists());
+    assert!(home.join("Library/LaunchAgents/com.noodle.daemon.plist").exists());
+
+    let config: Value =
+        serde_json::from_str(&fs::read_to_string(install_root.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(config["max_tokens"].as_i64(), Some(1024));
+    let chat_tools = config["plugins"]["chat"]["uses_tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        chat_tools
+            .iter()
+            .any(|item| item.as_str() == Some("mcp_tools_list")),
+        "{config}"
+    );
+    assert!(
+        chat_tools
+            .iter()
+            .any(|item| item.as_str() == Some("mcp_tool_call")),
+        "{config}"
+    );
+    assert!(
+        chat_tools
+            .iter()
+            .any(|item| item.as_str() == Some("mcp_resources_list")),
+        "{config}"
     );
 }
 

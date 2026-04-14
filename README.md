@@ -83,6 +83,12 @@ Two ways to invoke the agent:
 One-liner:
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/alexrudloff/noodle/main/scripts/install.sh | zsh
+```
+
+From a local checkout:
+
+```sh
 ./scripts/install.sh
 ```
 
@@ -107,7 +113,7 @@ source "$HOME/.noodle/plugin/noodle.plugin.zsh"
 Skip prompts entirely:
 
 ```sh
-NOODLE_INSTALL_CONFIGURE_LLM=0 ./scripts/install.sh
+NOODLE_INSTALL_CONFIGURE_LLM=0 zsh <(curl -fsSL https://raw.githubusercontent.com/alexrudloff/noodle/main/scripts/install.sh)
 ```
 
 Preseed values:
@@ -116,7 +122,7 @@ Preseed values:
 NOODLE_INSTALL_PROVIDER=openai_responses \
 NOODLE_INSTALL_MODEL=gpt-5 \
 NOODLE_INSTALL_API_KEY=... \
-./scripts/install.sh
+zsh <(curl -fsSL https://raw.githubusercontent.com/alexrudloff/noodle/main/scripts/install.sh)
 ```
 
 Config lives at `~/.noodle/config.json`.
@@ -415,7 +421,7 @@ Used by the e2e harness and local dev, not normal interactive use.
 <details>
 <summary><b>Installer only</b></summary>
 
-`NOODLE_INSTALL_CONFIGURE_LLM` · `NOODLE_INSTALL_PROVIDER` · `NOODLE_INSTALL_BASE_URL` · `NOODLE_INSTALL_API_KEY` · `NOODLE_INSTALL_MODEL` · `NOODLE_INSTALL_REASONING_EFFORT` · `NOODLE_INSTALL_TIMEOUT_SECONDS`
+`NOODLE_INSTALL_CONFIGURE_LLM` · `NOODLE_INSTALL_PROVIDER` · `NOODLE_INSTALL_BASE_URL` · `NOODLE_INSTALL_API_KEY` · `NOODLE_INSTALL_MODEL` · `NOODLE_INSTALL_REASONING_EFFORT` · `NOODLE_INSTALL_TIMEOUT_SECONDS` · `NOODLE_INSTALL_REPO_SLUG` · `NOODLE_INSTALL_REF` · `NOODLE_INSTALL_ARCHIVE_URL`
 
 </details>
 
