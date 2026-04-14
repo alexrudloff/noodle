@@ -19,7 +19,7 @@
 ![memory](https://img.shields.io/badge/memory-SQLite-003b57?style=flat-square)
 ![mcp](https://img.shields.io/badge/protocol-MCP-6b46c1?style=flat-square)
 
-[Install](#install) · [Quick Start](#quick-start) · [Plugins](#plugins) · [Tools](#built-in-tools) · [Config](#configuration) · [MCP](#tasks--mcp)
+[Install](#install) · [Quick Start](#quick-start) · [Modules](#modules) · [Tools](#built-in-tools) · [Config](#configuration) · [MCP](#tasks--mcp)
 
 </div>
 
@@ -89,9 +89,10 @@ The installer:
 
 1. Builds the Rust binary.
 2. Installs files into `~/.noodle`.
-3. Drops a launch agent at `~/Library/LaunchAgents/com.noodle.daemon.plist`.
-4. Bootstraps and kickstarts the daemon via `launchctl`.
-5. On first run, prompts for provider / model / API key and writes `~/.noodle/config.json`.
+3. Copies packaged modules into `~/.noodle/modules`.
+4. Drops a launch agent at `~/Library/LaunchAgents/com.noodle.daemon.plist`.
+5. Bootstraps and kickstarts the daemon via `launchctl`.
+6. On first run, prompts for provider / model / API key and writes `~/.noodle/config.json`.
 
 Then add this to your `~/.zshrc`:
 
@@ -148,15 +149,15 @@ Three pieces, one real host:
 - **Rust daemon + client** — a single `noodle` binary that serves a Unix socket (`~/.noodle/noodle.sock`), runs the MCP stdio server, owns the tool registry, model provider calls, memory, and permission decisions.
 - **Shared SQLite memory** (`~/.noodle/memory.db`) — three layers: immutable `events`, derived `state`, and compiled `artifacts` (including task records).
 
-The `zsh` layer is not the source of truth. The daemon owns plugin dispatch, tool definitions, MCP exposure, shared memory, task persistence, provider calls, and permission decisions.
+The `zsh` layer is not the source of truth. The daemon is the host: it discovers installed module manifests, dispatches events, owns tool definitions, shared memory, task persistence, provider calls, and permission decisions.
 
 ---
 
-## Plugins
+## Modules
 
-Six daemon plugins ship in the box. They split by job: some are deterministic and fast, some are model-assisted, some exist to make shell workflows less brittle.
+Six first-party modules ship in the box. They split by job: some are deterministic and fast, some are model-assisted, some exist to make shell workflows less brittle. All six are loaded from packaged module manifests under `modules/`, while the daemon stays responsible for tools, permissions, shared memory, task persistence, and provider calls.
 
-| Plugin      | What it is                                                                          | Try it                                           |
+| Module      | What it is                                                                          | Try it                                           |
 | ----------- | ----------------------------------------------------------------------------------- | ------------------------------------------------ |
 | [`utils`](docs/plugins/utils/README.md)       | Control plane for noodle. `/help`, `/status`, `/reload`, `/config ...`.         | `/config get plugins.order`                      |
 | [`memory`](docs/plugins/memory/README.md)     | Operator view over shared SQLite memory. Summarize, search, clear by plugin.   | `/memory search deploy`                          |
@@ -165,7 +166,7 @@ Six daemon plugins ship in the box. They split by job: some are deterministic an
 | [`chat`](docs/plugins/chat/README.md)         | The agent behind `oo` and the chat prefix. Tool use, planning, tasks, shells.   | `oo what changed in this repo?`                  |
 | [`typos`](docs/plugins/typos/README.md)       | Typo recovery for `command not found` and optional command-error fallback.      | `git stauts` → `git status`                      |
 
-Each plugin has its own README with behavior, commands, and config.
+Each module has its own README with behavior, commands, and config.
 
 ---
 
@@ -320,6 +321,15 @@ Plugin-specific memory settings live in the plugin READMEs:
 </details>
 
 <details>
+<summary><b><code>modules</code></b></summary>
+
+- `modules.paths` — directories the daemon scans for packaged module manifests
+
+By default installs place first-party modules under `~/.noodle/modules`.
+
+</details>
+
+<details>
 <summary><b><code>plugins</code></b></summary>
 
 - `plugins.order` — ordered list of enabled daemon plugins
@@ -424,11 +434,10 @@ src/planner.rs                 planning directives and task-plan parsing
 src/tasks.rs                   durable task records and resumable runtime state
 src/actions.rs                 DaemonAction enum streamed back to the adapter
 src/permissions.rs             permission class resolution
-src/memory_commands.rs         deterministic /memory handler
-src/todo.rs                    deterministic /todo handler
-src/utils.rs                   deterministic /help /status /reload /config
+modules/*/manifest.json        packaged module manifests discovered by the daemon
+modules/*/module.py            first-party external module entrypoints
 config/config.example.json     example configuration
-docs/plugins/*/README.md       per-plugin docs
+docs/plugins/*/README.md       per-module docs
 ```
 
 ---

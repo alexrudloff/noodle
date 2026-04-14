@@ -49,6 +49,9 @@
       "command_event_limit": 200
     }
   },
+  "modules": {
+    "paths": ["~/.noodle/modules"]
+  },
   "plugins": {
     "order": ["utils", "memory", "scripting", "todo", "chat", "typos"],
     "utils": {

@@ -1,0 +1,14 @@
+{
+  "id": "todo",
+  "handles_events": ["slash_command"],
+  "slash_commands": [
+    {
+      "name": "todo",
+      "description": "Manage a small terminal todo list stored in noodle memory.",
+      "usage": "/todo [list|add|/|x|done|reopen|remove|show|clear-done|help]"
+    }
+  ],
+  "uses_tools": [],
+  "exports_tools": [],
+  "command": ["python3", "${MODULE_DIR}/module.py"]
+}

@@ -1,0 +1,29 @@
+{
+  "id": "utils",
+  "handles_events": ["slash_command"],
+  "slash_commands": [
+    {
+      "name": "help",
+      "description": "Show available slash commands and usage.",
+      "usage": "/help"
+    },
+    {
+      "name": "status",
+      "description": "Show noodle status, active config, plugins, and permissions.",
+      "usage": "/status"
+    },
+    {
+      "name": "reload",
+      "description": "Reload noodle runtime config in the current shell.",
+      "usage": "/reload"
+    },
+    {
+      "name": "config",
+      "description": "Inspect or update noodle config from the terminal.",
+      "usage": "/config [help|show|get|set|unset] ..."
+    }
+  ],
+  "uses_tools": [],
+  "exports_tools": [],
+  "command": ["python3", "${MODULE_DIR}/module.py"]
+}

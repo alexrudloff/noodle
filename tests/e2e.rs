@@ -44,6 +44,10 @@ impl Drop for TempDir {
 fn write_test_config(temp: &TempDir, selection_mode: &str) -> PathBuf {
     let config_path = temp.path().join("config.json");
     let memory_path = temp.path().join("memory.db");
+    let modules_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("modules")
+        .display()
+        .to_string();
     let config = json!({
         "provider": "stub",
         "model": "gpt-5",
@@ -175,6 +179,9 @@ fn write_test_config(temp: &TempDir, selection_mode: &str) -> PathBuf {
             "todo": {
                 "command_event_limit": 200
             }
+        },
+        "modules": {
+            "paths": [modules_path]
         },
         "plugins": {
             "order": ["utils", "memory", "scripting", "todo", "chat", "typos"],
@@ -937,6 +944,34 @@ fn typos_autoruns_first_selection_end_to_end() {
         output.contains("typo-ok"),
         "expected typo correction to execute, got:\n{}",
         output
+    );
+}
+
+#[test]
+fn typo_selected_updates_memory_through_external_module() {
+    let temp = TempDir::new("noodle-e2e-typo-selected");
+    let config = write_test_config(&temp, "select");
+    let payload = run_mode(&temp, &config, "typo_selected", "die", Some("echo typo-ok"));
+    assert_eq!(payload["action"], "noop");
+    assert_eq!(payload["plugin"], "typos");
+
+    let memory = run_mode(
+        &temp,
+        &config,
+        "slash_command",
+        "/memory search typo-ok",
+        None,
+    );
+    let message = memory["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("typos.selection"),
+        "expected typo selection event in memory search, got:\n{}",
+        message
+    );
+    assert!(
+        message.contains("echo typo-ok"),
+        "expected selected command in memory search, got:\n{}",
+        message
     );
 }
 

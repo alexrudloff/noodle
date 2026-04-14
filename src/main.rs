@@ -3,53 +3,36 @@ mod context_builder;
 mod engine;
 mod executor;
 mod interactive_shell;
-mod memory_commands;
 mod permissions;
 mod planner;
-mod scripting;
 mod tasks;
-mod todo;
 mod tooling;
-mod utils;
 
-use crate::context_builder::{EventPromptInput, build_chat_base_prompt, build_event_prompt};
-use crate::memory_commands::handle_memory_command;
-use crate::scripting::handle_scripting_command;
 use crate::tasks::{cancel_task, list_task_records, load_task_record, load_task_runtime_state};
-use crate::todo::handle_todo_command;
-use crate::utils::handle_utils_command;
 use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 use tooling::{
-    ToolDefinition, enabled_plugin_manifests, exported_mcp_tools, invoke_builtin_tool,
-    plugin_matches_request, registered_slash_command_names, tools_for_plugin,
+    PluginExecution, ToolDefinition, enabled_plugin_manifests, exported_mcp_tools,
+    invoke_builtin_tool, plugin_matches_request, plugin_order, registered_slash_command_names,
+    tools_for_plugin,
 };
-
-const DEFAULT_TYPOS_PROMPT: &str = "You are a zsh typo fixer.\nThe user typed a mistaken command and zsh could not find it.\nReturn exactly 3 lines.\nEach line must contain only one command the user most likely intended to run in zsh.\nPrefer common shell commands over obscure executables.\nPrefer the intended zsh command, not merely the nearest executable name.\nNo numbering.\nNo explanation.\nNo extra text.\nInput: {user_input}\n";
-const DEFAULT_CHAT_PROMPT: &str = "You are noodle, a local terminal agent. You help the user think, search, inspect files, read and edit code, run commands, and complete tasks using the tools available to you. You are workspace-aware when relevant, but not limited to software engineering or zsh. Be concise, practical, and action-oriented.";
 
 #[derive(Clone)]
 struct CachedConfig {
     modified: Option<SystemTime>,
     value: Value,
-}
-
-fn noodle_soul_block(config: &Value) -> String {
-    match lookup(config, "soul") {
-        Some(Value::String(value)) if !value.trim().is_empty() => value.clone(),
-        _ => "You are noodle, a concise, helpful, calm, and direct zsh assistant. You live inside the user's terminal and answer briefly in plain text. Do not be theatrical or verbose.".into(),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +59,38 @@ enum Command {
     },
     PayloadFields {
         payload: Option<String>,
+    },
+    ModelOutput {
+        config: String,
+        prompt: Option<String>,
+        debug: bool,
+    },
+    ExecutionRun {
+        config: String,
+        request_json: Option<String>,
+        debug: bool,
+        stream: bool,
+    },
+    ExecutionResumePermission {
+        config: String,
+        permission_id: String,
+        decision: String,
+        debug: bool,
+        stream: bool,
+    },
+    MemoryContext {
+        config: String,
+        plugin: String,
+    },
+    MemoryRecordTurns {
+        config: String,
+        plugin: String,
+        user_text: String,
+        payload_json: Option<String>,
+        debug: bool,
+    },
+    WorkspaceContext {
+        cwd: String,
     },
     ToolList {
         config: String,
@@ -145,21 +160,58 @@ struct DaemonResponse {
     error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PluginId {
-    Todo,
-    Chat,
-    Typos,
+#[derive(Debug, Serialize)]
+struct ExternalPluginRequest<'a> {
+    event: &'a str,
+    input: &'a str,
+    cwd: &'a str,
+    shell: &'a str,
+    exit_status: i64,
+    recent_command: &'a str,
+    selected_command: &'a str,
+    debug: bool,
+    stream: bool,
+    config_path: String,
+    host: ExternalHostInfo,
+    config: &'a Value,
 }
 
-impl PluginId {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Todo => "todo",
-            Self::Chat => "chat",
-            Self::Typos => "typos",
-        }
-    }
+#[derive(Debug, Serialize)]
+struct ExternalHostInfo {
+    binary_path: String,
+    module_order: Vec<String>,
+    slash_commands: Vec<tooling::SlashCommandDefinition>,
+    tool_counts: HashMap<String, usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalPluginResponse {
+    ok: bool,
+    payload: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalPluginStreamEnvelope {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: Option<Value>,
+    ok: Option<bool>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalExecutionRequestInput {
+    plugin: String,
+    input: String,
+    working_directory: String,
+    base_prompt: String,
+    memory_context: String,
+    include_tool_context: Option<bool>,
+    tool_calling_enabled: Option<bool>,
+    task_execution_enabled: Option<bool>,
+    max_tool_rounds: Option<usize>,
+    max_replans: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +239,18 @@ fn run() -> Result<(), String> {
     match command {
         Command::Mcp => serve_mcp_stdio(),
         Command::Daemon { socket } => serve_daemon(&socket),
-        Command::Run { stream: true, .. } => execute_streaming(command),
+        Command::Run { stream: true, .. }
+        | Command::ExecutionRun { stream: true, .. }
+        | Command::ExecutionResumePermission { stream: true, .. } => execute_streaming(command),
+        Command::PayloadFields { .. }
+        | Command::ModelOutput { .. }
+        | Command::MemoryContext { .. }
+        | Command::MemoryRecordTurns { .. }
+        | Command::WorkspaceContext { .. } => {
+            let output = execute_local(command)?;
+            print!("{output}");
+            Ok(())
+        }
         other => {
             let output = execute_via_daemon(other)?;
             print!("{output}");
@@ -224,6 +287,38 @@ fn parse_args() -> Result<Command, String> {
         }),
         "payload-fields" => Ok(Command::PayloadFields {
             payload: optional_flag(&args[1..], "--payload"),
+        }),
+        "model-output" => Ok(Command::ModelOutput {
+            config: require_flag(&args[1..], "--config")?,
+            prompt: optional_flag(&args[1..], "--prompt"),
+            debug: args.iter().any(|arg| arg == "--debug"),
+        }),
+        "execution-run" => Ok(Command::ExecutionRun {
+            config: require_flag(&args[1..], "--config")?,
+            request_json: optional_flag(&args[1..], "--request"),
+            debug: args.iter().any(|arg| arg == "--debug"),
+            stream: args.iter().any(|arg| arg == "--stream"),
+        }),
+        "execution-resume-permission" => Ok(Command::ExecutionResumePermission {
+            config: require_flag(&args[1..], "--config")?,
+            permission_id: require_flag(&args[1..], "--permission-id")?,
+            decision: require_flag(&args[1..], "--decision")?,
+            debug: args.iter().any(|arg| arg == "--debug"),
+            stream: args.iter().any(|arg| arg == "--stream"),
+        }),
+        "memory-context" => Ok(Command::MemoryContext {
+            config: require_flag(&args[1..], "--config")?,
+            plugin: require_flag(&args[1..], "--plugin")?,
+        }),
+        "memory-record-turns" => Ok(Command::MemoryRecordTurns {
+            config: require_flag(&args[1..], "--config")?,
+            plugin: require_flag(&args[1..], "--plugin")?,
+            user_text: require_flag(&args[1..], "--user-text")?,
+            payload_json: optional_flag(&args[1..], "--payload"),
+            debug: args.iter().any(|arg| arg == "--debug"),
+        }),
+        "workspace-context" => Ok(Command::WorkspaceContext {
+            cwd: require_flag(&args[1..], "--cwd")?,
         }),
         "tool-list" => Ok(Command::ToolList {
             config: require_flag(&args[1..], "--config")?,
@@ -306,7 +401,16 @@ fn execute_via_daemon(command: Command) -> Result<String, String> {
     if env::var("NOODLE_BYPASS_DAEMON").ok().as_deref() == Some("1") {
         return execute_local(command);
     }
-    if let Command::PayloadFields { .. } = command {
+    if matches!(
+        command,
+        Command::PayloadFields { .. }
+            | Command::ModelOutput { .. }
+            | Command::ExecutionRun { .. }
+            | Command::ExecutionResumePermission { .. }
+            | Command::MemoryContext { .. }
+            | Command::MemoryRecordTurns { .. }
+            | Command::WorkspaceContext { .. }
+    ) {
         return execute_local(command);
     }
 
@@ -324,7 +428,12 @@ fn execute_via_daemon(command: Command) -> Result<String, String> {
 }
 
 fn execute_streaming(command: Command) -> Result<(), String> {
-    if env::var("NOODLE_BYPASS_DAEMON").ok().as_deref() == Some("1") {
+    if env::var("NOODLE_BYPASS_DAEMON").ok().as_deref() == Some("1")
+        || matches!(
+            command,
+            Command::ExecutionRun { .. } | Command::ExecutionResumePermission { .. }
+        )
+    {
         return execute_local_stream(command, &mut |payload| {
             println!("{payload}");
             io::stdout().flush().map_err(|err| err.to_string())
@@ -347,6 +456,110 @@ fn execute_streaming(command: Command) -> Result<(), String> {
         io::stdout().flush().map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+fn read_optional_text(value: Option<String>) -> Result<String, String> {
+    match value {
+        Some(value) => Ok(value),
+        None => {
+            let mut stdin = String::new();
+            io::stdin()
+                .read_to_string(&mut stdin)
+                .map_err(|err| err.to_string())?;
+            Ok(stdin)
+        }
+    }
+}
+
+fn debug_enabled(config: &Value, explicit_debug: bool) -> bool {
+    explicit_debug
+        || value_or_env(config, "NOODLE_DEBUG", "runtime.debug", "0") != "0"
+        || value_or_env(config, "NOODLE_DEBUG", "debug", "0") != "0"
+}
+
+fn execution_request_from_json(
+    config: &Value,
+    request_json: &str,
+) -> Result<engine::ChatExecutionConfig, String> {
+    let request: ExternalExecutionRequestInput =
+        serde_json::from_str(request_json).map_err(|err| err.to_string())?;
+    let plugin = request.plugin.trim();
+    if plugin.is_empty() {
+        return Err("execution request requires plugin".into());
+    }
+    Ok(engine::ChatExecutionConfig {
+        plugin: plugin.to_string(),
+        input: request.input,
+        working_directory: request.working_directory,
+        base_prompt: request.base_prompt,
+        memory_context: request.memory_context,
+        include_tool_context: request
+            .include_tool_context
+            .unwrap_or_else(|| plugin_include_tool_context(config, plugin)),
+        tool_calling_enabled: request
+            .tool_calling_enabled
+            .unwrap_or_else(|| engine::plugin_tool_calling_enabled(config, plugin)),
+        task_execution_enabled: request
+            .task_execution_enabled
+            .unwrap_or_else(|| engine::plugin_task_execution_enabled(config, plugin)),
+        max_tool_rounds: request
+            .max_tool_rounds
+            .unwrap_or_else(|| engine::plugin_max_tool_rounds(config, plugin)),
+        max_replans: request
+            .max_replans
+            .unwrap_or_else(|| engine::plugin_max_replans(config, plugin)),
+        available_tools: engine::plugin_tools_for_config(config, plugin),
+    })
+}
+
+fn emit_stream_envelope(
+    emit_line: &mut dyn FnMut(String) -> Result<(), String>,
+    kind: &str,
+    payload: Option<Value>,
+    error: Option<String>,
+) -> Result<(), String> {
+    emit_line(
+        serde_json::to_string(&json!({
+            "type": kind,
+            "ok": error.is_none(),
+            "payload": payload,
+            "error": error,
+        }))
+        .map_err(|err| err.to_string())?,
+    )
+}
+
+fn execute_external_execution(
+    config: &Value,
+    request_json: &str,
+    debug: bool,
+    streaming: bool,
+    emitter: &mut dyn FnMut(&actions::DaemonAction) -> Result<(), String>,
+) -> Result<Value, String> {
+    let request = execution_request_from_json(config, request_json)?;
+    let action = engine::run_chat_execution(config, request, streaming, emitter, &|prompt| {
+        model_output(config, prompt, debug)
+    })?;
+    Ok(action.into_value())
+}
+
+fn execute_permission_resume(
+    config: &Value,
+    permission_id: &str,
+    decision: &str,
+    debug: bool,
+    streaming: bool,
+    emitter: &mut dyn FnMut(&actions::DaemonAction) -> Result<(), String>,
+) -> Result<Value, String> {
+    let action = engine::resume_chat_execution_from_permission(
+        config,
+        permission_id,
+        decision,
+        streaming,
+        emitter,
+        &|prompt| model_output(config, prompt, debug),
+    )?;
+    Ok(action.into_value())
 }
 
 fn daemon_unavailable_error(socket: &str, cause: &str) -> String {
@@ -602,8 +815,22 @@ fn handle_mcp_tool_call(params: &Value) -> Result<Value, String> {
                 .get("message")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "chat.send requires message".to_string())?;
-            let debug = value_or_env(&config, "NOODLE_DEBUG", "runtime.debug", "0") != "0";
-            let payload = handle_chat(&config, &format!("oo {message}"), "", "mcp", 0, "", debug)?;
+            let debug = debug_enabled(&config, false);
+            let cwd = env::current_dir()
+                .ok()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            let payload = dispatch_event(
+                &config,
+                "command_not_found",
+                &format!("oo {message}"),
+                &cwd,
+                "mcp",
+                0,
+                "",
+                "",
+                debug,
+            )?;
             let reply = payload_text(&payload);
             Ok(json!({
                 "content": [
@@ -779,6 +1006,12 @@ fn to_request(command: Command) -> DaemonRequest {
             limit: None,
             stream: None,
         },
+        Command::ModelOutput { .. }
+        | Command::ExecutionRun { .. }
+        | Command::ExecutionResumePermission { .. }
+        | Command::MemoryContext { .. }
+        | Command::MemoryRecordTurns { .. }
+        | Command::WorkspaceContext { .. } => unreachable!(),
         Command::ToolList { config, plugin } => DaemonRequest {
             command: "tool-list".into(),
             mode: None,
@@ -979,6 +1212,12 @@ fn from_request(request: DaemonRequest) -> Command {
         "payload-fields" => Command::PayloadFields {
             payload: request.payload,
         },
+        "model-output"
+        | "execution-run"
+        | "execution-resume-permission"
+        | "memory-context"
+        | "memory-record-turns"
+        | "workspace-context" => unreachable!(),
         "tool-list" => Command::ToolList {
             config: request
                 .config
@@ -1070,17 +1309,83 @@ fn execute_local(command: Command) -> Result<String, String> {
             }
         }
         Command::PayloadFields { payload } => {
-            let payload = match payload {
-                Some(payload) => payload,
-                None => {
-                    let mut stdin = String::new();
-                    io::stdin()
-                        .read_to_string(&mut stdin)
-                        .map_err(|err| err.to_string())?;
-                    stdin
-                }
-            };
+            let payload = read_optional_text(payload)?;
             render_payload_fields(&payload)
+        }
+        Command::ModelOutput {
+            config,
+            prompt,
+            debug,
+        } => {
+            let prompt = read_optional_text(prompt)?;
+            let config = load_config(&config);
+            Ok(model_output(
+                &config,
+                &prompt,
+                debug_enabled(&config, debug),
+            )?)
+        }
+        Command::ExecutionRun {
+            config,
+            request_json,
+            debug,
+            ..
+        } => {
+            let request_json = read_optional_text(request_json)?;
+            let config = load_config(&config);
+            let debug = debug_enabled(&config, debug);
+            let mut noop = |_action: &actions::DaemonAction| Ok(());
+            let payload =
+                execute_external_execution(&config, &request_json, debug, false, &mut noop)?;
+            serde_json::to_string(&payload).map_err(|err| err.to_string())
+        }
+        Command::ExecutionResumePermission {
+            config,
+            permission_id,
+            decision,
+            debug,
+            ..
+        } => {
+            let config = load_config(&config);
+            let debug = debug_enabled(&config, debug);
+            let mut noop = |_action: &actions::DaemonAction| Ok(());
+            let payload = execute_permission_resume(
+                &config,
+                &permission_id,
+                &decision,
+                debug,
+                false,
+                &mut noop,
+            )?;
+            serde_json::to_string(&payload).map_err(|err| err.to_string())
+        }
+        Command::MemoryContext { config, plugin } => {
+            let config = load_config(&config);
+            Ok(memory_plugin_prompt_context(&config, &plugin)?)
+        }
+        Command::MemoryRecordTurns {
+            config,
+            plugin,
+            user_text,
+            payload_json,
+            debug,
+        } => {
+            let payload_json = read_optional_text(payload_json)?;
+            let config = load_config(&config);
+            let payload =
+                serde_json::from_str::<Value>(&payload_json).map_err(|err| err.to_string())?;
+            record_turn_memory(
+                &config,
+                &plugin,
+                &user_text,
+                &payload,
+                debug_enabled(&config, debug),
+            )?;
+            Ok(String::new())
+        }
+        Command::WorkspaceContext { cwd } => {
+            let sections = workspace_prompt_sections(&cwd);
+            serde_json::to_string(&sections).map_err(|err| err.to_string())
         }
         Command::ToolList { config, plugin } => {
             let config = load_config(&config);
@@ -1147,8 +1452,7 @@ fn execute_local(command: Command) -> Result<String, String> {
         }
         Command::TaskResume { config, task_id } => {
             let config = load_config(&config);
-            let debug = value_or_env(&config, "NOODLE_DEBUG", "runtime.debug", "0") != "0"
-                || value_or_env(&config, "NOODLE_DEBUG", "debug", "0") != "0";
+            let debug = debug_enabled(&config, false);
             let mut noop = |_action: &actions::DaemonAction| Ok(());
             let payload =
                 engine::resume_task_execution(&config, &task_id, false, &mut noop, &|prompt| {
@@ -1173,8 +1477,7 @@ fn execute_local(command: Command) -> Result<String, String> {
             ..
         } => {
             let config = load_config(&config);
-            let debug = value_or_env(&config, "NOODLE_DEBUG", "runtime.debug", "0") != "0"
-                || value_or_env(&config, "NOODLE_DEBUG", "debug", "0") != "0";
+            let debug = debug_enabled(&config, false);
             let payload = dispatch_event(
                 &config,
                 &mode,
@@ -1231,6 +1534,44 @@ fn execute_local_stream(
                 &mut emit_action,
             )?;
             emit_line(serde_json::to_string(&final_payload).map_err(|err| err.to_string())?)
+        }
+        Command::ExecutionRun {
+            config,
+            request_json,
+            debug,
+            ..
+        } => {
+            let request_json = read_optional_text(request_json)?;
+            let config = load_config(&config);
+            let debug = debug_enabled(&config, debug);
+            let mut emit_action = |action: &actions::DaemonAction| {
+                emit_stream_envelope(emit_line, "action", Some(action.clone().into_value()), None)
+            };
+            let final_payload =
+                execute_external_execution(&config, &request_json, debug, true, &mut emit_action)?;
+            emit_stream_envelope(emit_line, "final", Some(final_payload), None)
+        }
+        Command::ExecutionResumePermission {
+            config,
+            permission_id,
+            decision,
+            debug,
+            ..
+        } => {
+            let config = load_config(&config);
+            let debug = debug_enabled(&config, debug);
+            let mut emit_action = |action: &actions::DaemonAction| {
+                emit_stream_envelope(emit_line, "action", Some(action.clone().into_value()), None)
+            };
+            let final_payload = execute_permission_resume(
+                &config,
+                &permission_id,
+                &decision,
+                debug,
+                true,
+                &mut emit_action,
+            )?;
+            emit_stream_envelope(emit_line, "final", Some(final_payload), None)
         }
         other => {
             let output = execute_local(other)?;
@@ -1392,18 +1733,6 @@ fn memory_path(config: &Value) -> String {
     )
 }
 
-fn memory_typo_context_limit(config: &Value) -> usize {
-    value_to_i64(config, "memory.typos.context_limit", 3).max(1) as usize
-}
-
-fn memory_typo_selection_event_limit(config: &Value) -> i64 {
-    value_to_i64(config, "memory.typos.selection_event_limit", 200).max(10)
-}
-
-fn memory_todo_command_event_limit(config: &Value) -> i64 {
-    value_to_i64(config, "memory.todo.command_event_limit", 200).max(20)
-}
-
 fn memory_recent_turn_limit(config: &Value, plugin: &str, default: i64) -> i64 {
     value_to_i64(
         config,
@@ -1449,13 +1778,9 @@ fn memory_compile_prompt(config: &Value, plugin: &str, default: &str) -> String 
     )
 }
 
-fn plugin_memory_behavior(config: &Value, plugin: PluginId) -> PluginMemoryBehavior {
+fn plugin_memory_behavior(config: &Value, plugin: &str) -> PluginMemoryBehavior {
     match plugin {
-        PluginId::Todo => PluginMemoryBehavior {
-            event_limits: vec![("command", memory_todo_command_event_limit(config))],
-            compile: None,
-        },
-        PluginId::Chat => PluginMemoryBehavior {
+        "chat" => PluginMemoryBehavior {
             event_limits: vec![("turn", memory_recent_turn_limit(config, "chat", 24))],
             compile: Some(CompilePolicy {
                 event_kind: "turn",
@@ -1463,8 +1788,8 @@ fn plugin_memory_behavior(config: &Value, plugin: PluginId) -> PluginMemoryBehav
                 artifact_kind: "session_summary",
             }),
         },
-        PluginId::Typos => PluginMemoryBehavior {
-            event_limits: vec![("selection", memory_typo_selection_event_limit(config))],
+        _ => PluginMemoryBehavior {
+            event_limits: vec![],
             compile: None,
         },
     }
@@ -1698,28 +2023,23 @@ fn conversation_lines_from_event_values(items: &[(i64, String)]) -> Result<Vec<S
     Ok(lines)
 }
 
-fn compile_plugin_memory(config: &Value, plugin: PluginId, debug: bool) -> Result<(), String> {
+fn compile_plugin_memory(config: &Value, plugin: &str, debug: bool) -> Result<(), String> {
     match plugin {
-        PluginId::Todo => Ok(()),
-        PluginId::Chat => compile_conversation_memory(config, plugin, debug),
-        PluginId::Typos => Ok(()),
+        "chat" => compile_conversation_memory(config, plugin, debug),
+        _ => Ok(()),
     }
 }
 
-fn compile_conversation_memory(
-    config: &Value,
-    plugin: PluginId,
-    debug: bool,
-) -> Result<(), String> {
+fn compile_conversation_memory(config: &Value, plugin: &str, debug: bool) -> Result<(), String> {
     let behavior = plugin_memory_behavior(config, plugin);
     let Some(policy) = behavior.compile else {
         return Ok(());
     };
     let recent_values = memory_recent_event_values(
         config,
-        plugin.as_str(),
+        plugin,
         policy.event_kind,
-        memory_recent_turn_limit(config, plugin.as_str(), 24),
+        memory_recent_turn_limit(config, plugin, 24),
     )?;
     if recent_values.is_empty() {
         return Ok(());
@@ -1728,11 +2048,11 @@ fn compile_conversation_memory(
     if recent_lines.is_empty() {
         return Ok(());
     }
-    let existing = memory_active_artifact_content(config, plugin.as_str(), policy.artifact_kind)?
-        .unwrap_or_default();
+    let existing =
+        memory_active_artifact_content(config, plugin, policy.artifact_kind)?.unwrap_or_default();
     let compile_prompt = memory_compile_prompt(
         config,
-        plugin.as_str(),
+        plugin,
         "You maintain durable chat memory for noodle.\nRewrite the conversation into a compact factual memory note for future sessions.\nPreserve stable user facts, preferences, recurring goals, active tasks, and unresolved threads.\nPrefer concrete facts over chatter.\nKeep it concise, human-readable, and under 12 short bullet lines.\nDo not mention this instruction.\n",
     );
     let prompt = if existing.trim().is_empty() {
@@ -1753,7 +2073,7 @@ fn compile_conversation_memory(
     if compiled.trim().is_empty() {
         return Ok(());
     }
-    let summary_limit = memory_summary_max_chars(config, plugin.as_str(), 1600);
+    let summary_limit = memory_summary_max_chars(config, plugin, 1600);
     if compiled.len() > summary_limit {
         compiled.truncate(summary_limit);
     }
@@ -1762,19 +2082,13 @@ fn compile_conversation_memory(
         "event_count": recent_values.len(),
         "recent_event_ids": recent_values.iter().map(|(id, _)| id).collect::<Vec<_>>(),
     });
-    memory_upsert_artifact(
-        config,
-        plugin.as_str(),
-        policy.artifact_kind,
-        &compiled,
-        &source,
-    )?;
+    memory_upsert_artifact(config, plugin, policy.artifact_kind, &compiled, &source)?;
     Ok(())
 }
 
 pub(crate) fn memory_after_event(
     config: &Value,
-    plugin: PluginId,
+    plugin: &str,
     kind: &str,
     increment: i64,
     debug: bool,
@@ -1782,7 +2096,7 @@ pub(crate) fn memory_after_event(
     let behavior = plugin_memory_behavior(config, plugin);
     for (event_kind, limit) in behavior.event_limits {
         if event_kind == kind {
-            memory_trim_events(config, plugin.as_str(), kind, limit)?;
+            memory_trim_events(config, plugin, kind, limit)?;
         }
     }
 
@@ -1794,17 +2108,17 @@ pub(crate) fn memory_after_event(
     }
 
     let pending_key = format!("compile.pending.{}", policy.event_kind);
-    let mut pending = memory_increment_state_counter(config, plugin.as_str(), &pending_key)?;
+    let mut pending = memory_increment_state_counter(config, plugin, &pending_key)?;
     pending += increment - 1;
     if increment > 1 {
-        memory_set_state_counter(config, plugin.as_str(), &pending_key, pending)?;
+        memory_set_state_counter(config, plugin, &pending_key, pending)?;
     }
     if pending < policy.threshold {
         return Ok(());
     }
 
     compile_plugin_memory(config, plugin, debug)?;
-    memory_set_state_counter(config, plugin.as_str(), &pending_key, 0)?;
+    memory_set_state_counter(config, plugin, &pending_key, 0)?;
     Ok(())
 }
 
@@ -1835,91 +2149,31 @@ fn memory_plugin_prompt_context(config: &Value, plugin: &str) -> Result<String, 
     Ok(sections.join("\n\n"))
 }
 
-fn memory_typo_context(
-    config: &Value,
-    input: &str,
-    limit: usize,
-) -> Result<Vec<(String, i64)>, String> {
-    let conn = memory_connection(config)?;
-    let prefix = format!("{input}\t");
-    let pattern = format!("{prefix}%");
-    let mut stmt = conn
-        .prepare(
-            "SELECT key, value_json
-             FROM state
-             WHERE plugin = 'typos' AND key LIKE ?1
-             ORDER BY updated_at DESC",
-        )
-        .map_err(|err| err.to_string())?;
-    let rows = stmt
-        .query_map(params![pattern], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|err| err.to_string())?;
-    let mut results = Vec::new();
-    for row in rows {
-        let (key, raw) = row.map_err(|err| err.to_string())?;
-        let selected = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
-        let count = serde_json::from_str::<Value>(&raw)
-            .ok()
-            .and_then(|value| value.as_i64())
-            .unwrap_or(0);
-        results.push((selected, count));
-    }
-    results.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    results.truncate(limit);
-    Ok(results)
-}
-
-fn build_prompt(
+fn record_turn_memory(
     config: &Value,
     plugin: &str,
-    input: &str,
-    cwd: &str,
-    shell: &str,
-    exit_status: i64,
-    recent_command: &str,
-    extra_sections: &[String],
-) -> String {
-    let (mode, env_name, key, default_prompt, include_soul) = match plugin {
-        "chat" => (
-            "chat",
-            "NOODLE_CHAT_PROMPT",
-            "plugins.chat.prompt",
-            DEFAULT_CHAT_PROMPT,
-            true,
-        ),
-        _ => (
-            "command_not_found",
-            "NOODLE_PROMPT",
-            "plugins.typos.prompt",
-            DEFAULT_TYPOS_PROMPT,
-            false,
-        ),
-    };
-    let template = value_or_env(config, env_name, key, default_prompt);
-    if plugin == "chat" {
-        return build_chat_base_prompt(
-            &template,
-            input,
-            cwd,
-            shell,
-            recent_command,
-            include_soul.then(|| noodle_soul_block(config)).as_deref(),
-            extra_sections,
-        );
-    }
-    build_event_prompt(EventPromptInput {
-        mode,
-        template: &template,
-        input,
-        cwd,
-        shell,
-        exit_status,
-        recent_command,
-        soul: include_soul.then(|| noodle_soul_block(config)).as_deref(),
-        extra_sections,
-    })
+    user_text: &str,
+    payload: &Value,
+    debug: bool,
+) -> Result<(), String> {
+    let action = actions::DaemonAction::from_value(payload)?;
+    let assistant_text = action.primary_text().unwrap_or_default();
+    memory_append_event(
+        config,
+        plugin,
+        "turn",
+        "user",
+        &json!({"role":"user","text": user_text}),
+    )?;
+    memory_append_event(
+        config,
+        plugin,
+        "turn",
+        "assistant",
+        &json!({"role":"assistant","text": assistant_text}),
+    )?;
+    memory_after_event(config, plugin, "turn", 2, debug)?;
+    Ok(())
 }
 
 fn plugin_include_tool_context(config: &Value, plugin: &str) -> bool {
@@ -1930,6 +2184,271 @@ fn plugin_include_tool_context(config: &Value, plugin: &str) -> bool {
         &format!("plugins.{plugin}.include_tool_context"),
         "0",
     ) != "0"
+}
+
+fn resolved_config_path(config: &Value) -> String {
+    lookup(config, "_meta.config_path")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            env::var("NOODLE_CONFIG").unwrap_or_else(|_| "~/.noodle/config.json".into())
+        })
+}
+
+fn external_host_info(config: &Value) -> ExternalHostInfo {
+    let module_order = plugin_order(config);
+    let slash_commands = tooling::registered_slash_command_definitions(config);
+    let tool_counts = module_order
+        .iter()
+        .map(|plugin| (plugin.clone(), tools_for_plugin(config, plugin).len()))
+        .collect::<HashMap<_, _>>();
+    ExternalHostInfo {
+        binary_path: env::current_exe()
+            .ok()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "noodle".into()),
+        module_order,
+        slash_commands,
+        tool_counts,
+    }
+}
+
+fn spawn_external_plugin(
+    manifest: &tooling::PluginManifest,
+    config: &Value,
+    event: &str,
+    input: &str,
+    cwd: &str,
+    shell: &str,
+    exit_status: i64,
+    recent_command: &str,
+    selected_command: &str,
+    debug: bool,
+    stream: bool,
+) -> Result<std::process::Child, String> {
+    let PluginExecution::External {
+        manifest_path,
+        command,
+    } = &manifest.execution
+    else {
+        return Err(format!("plugin {} is not external", manifest.id));
+    };
+    let program = command
+        .first()
+        .ok_or_else(|| format!("external plugin {} has no command", manifest.id))?;
+    let request = ExternalPluginRequest {
+        event,
+        input,
+        cwd,
+        shell,
+        exit_status,
+        recent_command,
+        selected_command,
+        debug,
+        stream,
+        config_path: resolved_config_path(config),
+        host: external_host_info(config),
+        config,
+    };
+    let request_body = serde_json::to_vec(&request).map_err(|err| err.to_string())?;
+    let mut child = ProcessCommand::new(program)
+        .args(command.iter().skip(1))
+        .current_dir(
+            Path::new(cwd)
+                .is_dir()
+                .then_some(cwd)
+                .unwrap_or_else(|| manifest_path.parent().and_then(Path::to_str).unwrap_or(".")),
+        )
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to start external plugin {}: {}", manifest.id, err))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&request_body)
+            .map_err(|err| format!("failed to write request to plugin {}: {}", manifest.id, err))?;
+    }
+    Ok(child)
+}
+
+fn invoke_external_plugin(
+    manifest: &tooling::PluginManifest,
+    config: &Value,
+    event: &str,
+    input: &str,
+    cwd: &str,
+    shell: &str,
+    exit_status: i64,
+    recent_command: &str,
+    selected_command: &str,
+    debug: bool,
+) -> Result<Value, String> {
+    let child = spawn_external_plugin(
+        manifest,
+        config,
+        event,
+        input,
+        cwd,
+        shell,
+        exit_status,
+        recent_command,
+        selected_command,
+        debug,
+        false,
+    )?;
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed waiting for plugin {}: {}", manifest.id, err))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!(
+            "external plugin {} failed{}",
+            manifest.id,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", detail)
+            }
+        ));
+    }
+    let response: ExternalPluginResponse = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("invalid response from plugin {}: {}", manifest.id, err))?;
+    if response.ok {
+        response
+            .payload
+            .ok_or_else(|| format!("plugin {} returned no payload", manifest.id))
+    } else {
+        Err(response
+            .error
+            .unwrap_or_else(|| format!("plugin {} request failed", manifest.id)))
+    }
+}
+
+fn invoke_external_plugin_streaming(
+    manifest: &tooling::PluginManifest,
+    config: &Value,
+    event: &str,
+    input: &str,
+    cwd: &str,
+    shell: &str,
+    exit_status: i64,
+    recent_command: &str,
+    selected_command: &str,
+    debug: bool,
+    emitter: &mut dyn FnMut(&actions::DaemonAction) -> Result<(), String>,
+) -> Result<Value, String> {
+    let mut child = spawn_external_plugin(
+        manifest,
+        config,
+        event,
+        input,
+        cwd,
+        shell,
+        exit_status,
+        recent_command,
+        selected_command,
+        debug,
+        true,
+    )?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("plugin {} has no stdout", manifest.id))?;
+    let mut stderr = String::new();
+    let mut stderr_pipe = child.stderr.take();
+    let reader = io::BufReader::new(stdout);
+    let mut final_payload: Option<Value> = None;
+
+    for line in reader.lines() {
+        let line = line.map_err(|err| err.to_string())?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let raw: Value = serde_json::from_str(trimmed).map_err(|err| {
+            format!(
+                "invalid streamed response from plugin {}: {}",
+                manifest.id, err
+            )
+        })?;
+        if raw.get("type").is_some() {
+            let envelope: ExternalPluginStreamEnvelope =
+                serde_json::from_value(raw).map_err(|err| {
+                    format!(
+                        "invalid stream envelope from plugin {}: {}",
+                        manifest.id, err
+                    )
+                })?;
+            match envelope.kind.as_str() {
+                "action" => {
+                    let payload = envelope.payload.ok_or_else(|| {
+                        format!("plugin {} action message missing payload", manifest.id)
+                    })?;
+                    let action = actions::DaemonAction::from_value(&payload)?;
+                    emitter(&action)?;
+                }
+                "final" => {
+                    if envelope.ok.unwrap_or(true) {
+                        final_payload = envelope.payload;
+                    } else {
+                        return Err(envelope.error.unwrap_or_else(|| {
+                            format!("plugin {} streaming request failed", manifest.id)
+                        }));
+                    }
+                }
+                "error" => {
+                    return Err(envelope.error.unwrap_or_else(|| {
+                        format!("plugin {} streaming request failed", manifest.id)
+                    }));
+                }
+                other => {
+                    return Err(format!(
+                        "unknown stream message type from plugin {}: {}",
+                        manifest.id, other
+                    ));
+                }
+            }
+            continue;
+        }
+
+        if raw.get("ok").is_some() {
+            let response: ExternalPluginResponse = serde_json::from_value(raw)
+                .map_err(|err| format!("invalid response from plugin {}: {}", manifest.id, err))?;
+            if response.ok {
+                final_payload = response.payload;
+            } else {
+                return Err(response
+                    .error
+                    .unwrap_or_else(|| format!("plugin {} request failed", manifest.id)));
+            }
+            continue;
+        }
+
+        final_payload = Some(raw);
+    }
+
+    if let Some(mut pipe) = stderr_pipe.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed waiting for plugin {}: {}", manifest.id, err))?;
+    if !status.success() {
+        let detail = stderr.trim().to_string();
+        return Err(format!(
+            "external plugin {} failed{}",
+            manifest.id,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", detail)
+            }
+        ));
+    }
+    final_payload.ok_or_else(|| format!("plugin {} returned no payload", manifest.id))
 }
 
 fn dispatch_event(
@@ -1943,12 +2462,6 @@ fn dispatch_event(
     selected_command: &str,
     debug: bool,
 ) -> Result<Value, String> {
-    if event == "typo_selected" {
-        return handle_typo_selected(config, input, selected_command);
-    }
-    if event == "permission_response" {
-        return handle_permission_response(config, input, selected_command, debug);
-    }
     let manifests = enabled_plugin_manifests(config);
     let plugin_ids = manifests
         .iter()
@@ -1963,48 +2476,23 @@ fn dispatch_event(
         if !plugin_matches_request(config, &manifest, event, input) {
             continue;
         }
-        match manifest.id {
-            "utils" => {
-                debug_log(debug, "matched_plugin", "utils");
-                return handle_utils_command(config, input);
-            }
-            "memory" => {
-                debug_log(debug, "matched_plugin", "memory");
-                return handle_memory_command(config, input);
-            }
-            "scripting" => {
-                debug_log(debug, "matched_plugin", "scripting");
-                return handle_scripting_command(config, input);
-            }
-            "todo" => {
-                debug_log(debug, "matched_plugin", "todo");
-                return handle_todo_command(config, input);
-            }
-            "chat" => {
-                debug_log(debug, "matched_plugin", "chat");
-                return handle_chat(
+        match &manifest.execution {
+            PluginExecution::External { .. } => {
+                debug_log(debug, "matched_plugin", &manifest.id);
+                return invoke_external_plugin(
+                    &manifest,
                     config,
+                    event,
                     input,
                     cwd,
                     shell,
                     exit_status,
                     recent_command,
+                    selected_command,
                     debug,
                 );
             }
-            "typos" => {
-                debug_log(debug, "matched_plugin", "typos");
-                return handle_typos(
-                    config,
-                    input,
-                    cwd,
-                    shell,
-                    exit_status,
-                    recent_command,
-                    debug,
-                );
-            }
-            _ => {}
+            PluginExecution::Builtin => {}
         }
     }
     Err("no daemon plugin handled event".into())
@@ -2022,77 +2510,31 @@ fn dispatch_event_streaming(
     debug: bool,
     emitter: &mut dyn FnMut(&actions::DaemonAction) -> Result<(), String>,
 ) -> Result<Value, String> {
-    if event == "typo_selected" {
-        return handle_typo_selected(config, input, selected_command);
-    }
-    if event == "permission_response" {
-        return handle_permission_response_streaming(
-            config,
-            input,
-            selected_command,
-            debug,
-            emitter,
-        );
-    }
     let manifests = enabled_plugin_manifests(config);
     for manifest in manifests {
         if !plugin_matches_request(config, &manifest, event, input) {
             continue;
         }
-        match manifest.id {
-            "utils" => {
-                return handle_utils_command(config, input);
-            }
-            "memory" => {
-                return handle_memory_command(config, input);
-            }
-            "scripting" => {
-                return handle_scripting_command(config, input);
-            }
-            "todo" => {
-                return handle_todo_command(config, input);
-            }
-            "chat" => {
-                return handle_chat_streaming(
+        match &manifest.execution {
+            PluginExecution::External { .. } => {
+                return invoke_external_plugin_streaming(
+                    &manifest,
                     config,
+                    event,
                     input,
                     cwd,
                     shell,
                     exit_status,
                     recent_command,
+                    selected_command,
                     debug,
                     emitter,
                 );
             }
-            "typos" => {
-                return handle_typos(
-                    config,
-                    input,
-                    cwd,
-                    shell,
-                    exit_status,
-                    recent_command,
-                    debug,
-                );
-            }
-            _ => continue,
+            PluginExecution::Builtin => {}
         }
     }
     Err("no daemon plugin handled event".into())
-}
-
-fn chat_input(config: &Value, raw_input: &str) -> String {
-    let prefix = value_or_env(config, "NOODLE_CHAT_PREFIX", "plugins.chat.prefix", ",");
-    let trimmed = if raw_input == "oo" {
-        ""
-    } else if raw_input.starts_with("oo ") {
-        raw_input.strip_prefix("oo").unwrap_or(raw_input)
-    } else if raw_input.starts_with(&prefix) {
-        raw_input.strip_prefix(&prefix).unwrap_or(raw_input)
-    } else {
-        raw_input
-    };
-    trimmed.trim_start().to_string()
 }
 
 fn workspace_prompt_sections(cwd: &str) -> Vec<String> {
@@ -2198,278 +2640,6 @@ fn discover_workspace_root(start: &Path) -> PathBuf {
             return start.to_path_buf();
         }
     }
-}
-
-fn handle_agentic_plugin(
-    config: &Value,
-    plugin: PluginId,
-    raw_input: &str,
-    cwd: &str,
-    shell: &str,
-    exit_status: i64,
-    recent_command: &str,
-    debug: bool,
-    extra_sections: &[String],
-) -> Result<Value, String> {
-    let plugin_name = plugin.as_str();
-    let input = chat_input(config, raw_input);
-    let prompt = build_prompt(
-        config,
-        plugin_name,
-        &input,
-        cwd,
-        shell,
-        exit_status,
-        recent_command,
-        extra_sections,
-    );
-    let memory_context = memory_plugin_prompt_context(config, plugin_name)?;
-    let request = engine::ChatExecutionConfig {
-        plugin: plugin_name.into(),
-        input: input.clone(),
-        working_directory: cwd.into(),
-        base_prompt: prompt,
-        memory_context,
-        include_tool_context: plugin_include_tool_context(config, plugin_name),
-        tool_calling_enabled: engine::plugin_tool_calling_enabled(config, plugin_name),
-        task_execution_enabled: engine::plugin_task_execution_enabled(config, plugin_name),
-        max_tool_rounds: engine::plugin_max_tool_rounds(config, plugin_name),
-        max_replans: engine::plugin_max_replans(config, plugin_name),
-        available_tools: engine::plugin_tools_for_config(config, plugin_name),
-    };
-    let mut noop = |_action: &actions::DaemonAction| Ok(());
-    let action = engine::run_chat_execution(config, request, false, &mut noop, &|prompt| {
-        model_output(config, prompt, debug)
-    })?;
-    let message = action.primary_text().unwrap_or_default();
-    memory_append_event(
-        config,
-        plugin_name,
-        "turn",
-        "user",
-        &json!({"role":"user","text": input}),
-    )?;
-    memory_append_event(
-        config,
-        plugin_name,
-        "turn",
-        "assistant",
-        &json!({"role":"assistant","text": message}),
-    )?;
-    memory_after_event(config, plugin, "turn", 2, debug)?;
-    Ok(action.into_value())
-}
-
-fn handle_agentic_plugin_streaming(
-    config: &Value,
-    plugin: PluginId,
-    raw_input: &str,
-    cwd: &str,
-    shell: &str,
-    exit_status: i64,
-    recent_command: &str,
-    debug: bool,
-    extra_sections: &[String],
-    emitter: &mut dyn FnMut(&actions::DaemonAction) -> Result<(), String>,
-) -> Result<Value, String> {
-    let plugin_name = plugin.as_str();
-    let input = chat_input(config, raw_input);
-    let prompt = build_prompt(
-        config,
-        plugin_name,
-        &input,
-        cwd,
-        shell,
-        exit_status,
-        recent_command,
-        extra_sections,
-    );
-    let memory_context = memory_plugin_prompt_context(config, plugin_name)?;
-    let request = engine::ChatExecutionConfig {
-        plugin: plugin_name.into(),
-        input: input.clone(),
-        working_directory: cwd.into(),
-        base_prompt: prompt,
-        memory_context,
-        include_tool_context: plugin_include_tool_context(config, plugin_name),
-        tool_calling_enabled: engine::plugin_tool_calling_enabled(config, plugin_name),
-        task_execution_enabled: engine::plugin_task_execution_enabled(config, plugin_name),
-        max_tool_rounds: engine::plugin_max_tool_rounds(config, plugin_name),
-        max_replans: engine::plugin_max_replans(config, plugin_name),
-        available_tools: engine::plugin_tools_for_config(config, plugin_name),
-    };
-    let action = engine::run_chat_execution(config, request, true, emitter, &|prompt| {
-        model_output(config, prompt, debug)
-    })?;
-    let message = action.primary_text().unwrap_or_default();
-    memory_append_event(
-        config,
-        plugin_name,
-        "turn",
-        "user",
-        &json!({"role":"user","text": input}),
-    )?;
-    memory_append_event(
-        config,
-        plugin_name,
-        "turn",
-        "assistant",
-        &json!({"role":"assistant","text": message}),
-    )?;
-    memory_after_event(config, plugin, "turn", 2, debug)?;
-    Ok(action.into_value())
-}
-
-fn handle_chat(
-    config: &Value,
-    raw_input: &str,
-    cwd: &str,
-    shell: &str,
-    exit_status: i64,
-    recent_command: &str,
-    debug: bool,
-) -> Result<Value, String> {
-    let extra_sections = workspace_prompt_sections(cwd);
-    handle_agentic_plugin(
-        config,
-        PluginId::Chat,
-        raw_input,
-        cwd,
-        shell,
-        exit_status,
-        recent_command,
-        debug,
-        &extra_sections,
-    )
-}
-
-fn handle_chat_streaming(
-    config: &Value,
-    raw_input: &str,
-    cwd: &str,
-    shell: &str,
-    exit_status: i64,
-    recent_command: &str,
-    debug: bool,
-    emitter: &mut dyn FnMut(&actions::DaemonAction) -> Result<(), String>,
-) -> Result<Value, String> {
-    let extra_sections = workspace_prompt_sections(cwd);
-    handle_agentic_plugin_streaming(
-        config,
-        PluginId::Chat,
-        raw_input,
-        cwd,
-        shell,
-        exit_status,
-        recent_command,
-        debug,
-        &extra_sections,
-        emitter,
-    )
-}
-
-fn handle_typos(
-    config: &Value,
-    input: &str,
-    cwd: &str,
-    shell: &str,
-    exit_status: i64,
-    recent_command: &str,
-    debug: bool,
-) -> Result<Value, String> {
-    let typo_context = memory_typo_context(config, input, memory_typo_context_limit(config))?;
-    let mut extra_sections = Vec::new();
-    if !typo_context.is_empty() {
-        let lines = typo_context
-            .into_iter()
-            .map(|(choice, count)| format!("- {} ({})", choice, count))
-            .collect::<Vec<_>>()
-            .join("\n");
-        extra_sections.push(format!(
-            "Past selected corrections for this exact input:\n{}",
-            lines
-        ));
-    }
-    let template = value_or_env(
-        config,
-        "NOODLE_PROMPT",
-        "plugins.typos.prompt",
-        DEFAULT_TYPOS_PROMPT,
-    );
-    let prompt = build_event_prompt(EventPromptInput {
-        mode: "command_not_found",
-        template: &template,
-        input,
-        cwd,
-        shell,
-        exit_status,
-        recent_command,
-        soul: None,
-        extra_sections: &extra_sections,
-    });
-    let output = model_output(config, &prompt, debug)?;
-    let mut payload = infer_payload(&clean_response_text(&output))?;
-    if let Some(obj) = payload.as_object_mut() {
-        obj.insert("plugin".into(), json!("typos"));
-    }
-    Ok(payload)
-}
-
-fn handle_typo_selected(
-    config: &Value,
-    input: &str,
-    selected_command: &str,
-) -> Result<Value, String> {
-    if input.trim().is_empty() || selected_command.trim().is_empty() {
-        return Ok(json!({"action":"noop","plugin":"memory"}));
-    }
-    memory_append_event(
-        config,
-        "typos",
-        "selection",
-        input,
-        &json!({"input": input, "selected": selected_command}),
-    )?;
-    let state_key = format!("{input}\t{selected_command}");
-    let _ = memory_increment_state_counter(config, "typos", &state_key)?;
-    memory_after_event(config, PluginId::Typos, "selection", 1, false)?;
-    Ok(json!({"action":"noop","plugin":"memory"}))
-}
-
-fn handle_permission_response(
-    config: &Value,
-    permission_id: &str,
-    decision: &str,
-    debug: bool,
-) -> Result<Value, String> {
-    let mut noop = |_action: &actions::DaemonAction| Ok(());
-    let action = engine::resume_chat_execution_from_permission(
-        config,
-        permission_id,
-        decision,
-        false,
-        &mut noop,
-        &|prompt| model_output(config, prompt, debug),
-    )?;
-    Ok(action.into_value())
-}
-
-fn handle_permission_response_streaming(
-    config: &Value,
-    permission_id: &str,
-    decision: &str,
-    debug: bool,
-    emitter: &mut dyn FnMut(&actions::DaemonAction) -> Result<(), String>,
-) -> Result<Value, String> {
-    let action = engine::resume_chat_execution_from_permission(
-        config,
-        permission_id,
-        decision,
-        true,
-        emitter,
-        &|prompt| model_output(config, prompt, debug),
-    )?;
-    Ok(action.into_value())
 }
 
 fn model_output(config: &Value, prompt: &str, debug: bool) -> Result<String, String> {
@@ -2820,53 +2990,9 @@ fn clean_response_text(text: &str) -> String {
         .join("\n")
 }
 
-fn infer_payload(text: &str) -> Result<Value, String> {
-    if text.trim().is_empty() {
-        return Err("empty model response".into());
-    }
-    let lines = text
-        .lines()
-        .map(normalize_line)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        return Err("empty model response".into());
-    }
-    if lines.len() > 1 {
-        let choices = dedupe(lines.into_iter().take(3).collect());
-        return Ok(json!({"action": "select", "choices": choices}));
-    }
-    let line = &lines[0];
-    if line.ends_with('?') {
-        return Ok(json!({"action": "ask", "question": line}));
-    }
-    Ok(json!({"action": "run", "command": line, "explanation": ""}))
-}
-
-fn normalize_line(line: &str) -> String {
-    line.trim()
-        .trim_matches('`')
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim()
-        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == ':')
-        .trim()
-        .to_string()
-}
-
-fn dedupe(items: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    for item in items {
-        if !item.is_empty() && seen.insert(item.clone()) {
-            result.push(item);
-        }
-    }
-    result
-}
-
 fn render_runtime_config(config: &Value) -> String {
     let slash_commands = registered_slash_command_names(config).join(" ");
+    let plugin_order_text = plugin_order(config).join(" ");
     format!(
         "debug={}\nauto_run={}\nenable_error_fallback={}\nmax_retry_depth={}\nplugin_order={}\nselection_mode={}\nslash_commands={}\nchat_prefix={}\n",
         value_or_env(config, "NOODLE_DEBUG", "runtime.debug", "0"),
@@ -2883,12 +3009,7 @@ fn render_runtime_config(config: &Value) -> String {
             "runtime.max_retry_depth",
             "2"
         ),
-        value_or_env(
-            config,
-            "NOODLE_PLUGIN_ORDER",
-            "plugins.order",
-            "utils memory scripting todo chat typos",
-        ),
+        env::var("NOODLE_PLUGIN_ORDER").unwrap_or(plugin_order_text),
         value_or_env(
             config,
             "NOODLE_SELECTION_MODE",

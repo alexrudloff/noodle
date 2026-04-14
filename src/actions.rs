@@ -82,6 +82,120 @@ pub enum DaemonAction {
 }
 
 impl DaemonAction {
+    pub fn from_value(value: &Value) -> Result<Self, String> {
+        let action = value
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "missing action".to_string())?;
+        let plugin = value
+            .get("plugin")
+            .and_then(Value::as_str)
+            .unwrap_or("host")
+            .to_string();
+        let required_string = |key: &str| -> Result<String, String> {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| format!("missing {key}"))
+        };
+        let required_usize = |key: &str| -> Result<usize, String> {
+            value
+                .get(key)
+                .and_then(Value::as_u64)
+                .map(|number| number as usize)
+                .ok_or_else(|| format!("missing {key}"))
+        };
+
+        match action {
+            "message" => Ok(Self::Message {
+                plugin,
+                message: required_string("message")?,
+            }),
+            "reload_runtime" => Ok(Self::ReloadRuntime {
+                plugin,
+                message: required_string("message")?,
+            }),
+            "ask" => Ok(Self::Ask {
+                plugin,
+                question: required_string("question")?,
+            }),
+            "run" => Ok(Self::Run {
+                plugin,
+                command: required_string("command")?,
+                explanation: required_string("explanation")?,
+            }),
+            "select" => Ok(Self::Select {
+                plugin,
+                choices: value
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "missing choices".to_string())?
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect(),
+            }),
+            "permission_request" => Ok(Self::PermissionRequest {
+                plugin,
+                permission_id: required_string("permission_id")?,
+                tool: required_string("tool")?,
+                permission_class: required_string("permission_class")?,
+                summary: required_string("summary")?,
+            }),
+            "tool_step" => Ok(Self::ToolStep {
+                plugin,
+                tool: required_string("tool")?,
+                status: required_string("status")?,
+                summary: required_string("summary")?,
+            }),
+            "session_started" => Ok(Self::SessionStarted {
+                plugin,
+                command: required_string("command")?,
+            }),
+            "session_input" => Ok(Self::SessionInput {
+                plugin,
+                text: required_string("text")?,
+            }),
+            "session_output" => Ok(Self::SessionOutput {
+                plugin,
+                text: required_string("text")?,
+            }),
+            "session_closed" => Ok(Self::SessionClosed { plugin }),
+            "task_started" => Ok(Self::TaskStarted {
+                plugin,
+                task_id: required_string("task_id")?,
+                summary: required_string("summary")?,
+            }),
+            "task_step" => Ok(Self::TaskStep {
+                plugin,
+                task_id: required_string("task_id")?,
+                index: required_usize("index")?,
+                total: required_usize("total")?,
+                tool: required_string("tool")?,
+                status: required_string("status")?,
+                summary: required_string("summary")?,
+            }),
+            "task_finished" => Ok(Self::TaskFinished {
+                plugin,
+                task_id: required_string("task_id")?,
+                status: required_string("status")?,
+                summary: required_string("summary")?,
+            }),
+            "batch" => Ok(Self::Batch {
+                plugin,
+                actions: value
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "missing items".to_string())?
+                    .iter()
+                    .map(Self::from_value)
+                    .collect::<Result<Vec<_>, _>>()?,
+            }),
+            "noop" => Ok(Self::Noop { plugin }),
+            other => Err(format!("unknown action: {other}")),
+        }
+    }
+
     pub fn into_value(self) -> Value {
         match self {
             Self::Message { plugin, message } => {

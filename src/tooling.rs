@@ -71,19 +71,29 @@ pub struct ToolDefinition {
 
 #[derive(Debug, Clone)]
 pub struct PluginManifest {
-    pub id: &'static str,
-    pub handles_events: Vec<&'static str>,
-    pub slash_commands: Vec<&'static str>,
-    pub uses_tools: Vec<&'static str>,
-    pub exports_mcp_tools: Vec<&'static str>,
+    pub id: String,
+    pub handles_events: Vec<String>,
+    pub slash_commands: Vec<SlashCommandDefinition>,
+    pub uses_tools: Vec<String>,
+    pub exports_mcp_tools: Vec<String>,
+    pub execution: PluginExecution,
+}
+
+#[derive(Debug, Clone)]
+pub enum PluginExecution {
+    Builtin,
+    External {
+        manifest_path: PathBuf,
+        command: Vec<String>,
+    },
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SlashCommandDefinition {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub usage: &'static str,
+    pub name: String,
+    pub description: String,
+    pub usage: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -396,80 +406,152 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
-pub fn plugin_manifest(plugin_id: &str) -> PluginManifest {
-    match plugin_id {
-        "chat" => PluginManifest {
-            id: "chat",
-            handles_events: vec!["command_not_found", "command_error"],
-            slash_commands: vec![],
-            uses_tools: vec![
-                "memory_query",
-                "file_read",
-                "path_search",
-                "glob",
-                "grep",
-                "web_fetch",
-                "web_search",
-                "file_write",
-                "file_edit",
-                "shell_exec",
-                "interactive_shell_start",
-                "interactive_shell_read",
-                "interactive_shell_write",
-                "interactive_shell_key",
-                "interactive_shell_close",
-                "mcp_resource_read",
-                "task_note_write",
-                "agent_handoff_create",
-            ],
-            exports_mcp_tools: vec!["chat.send"],
-        },
-        "typos" => PluginManifest {
-            id: "typos",
-            handles_events: vec!["command_not_found", "command_error"],
-            slash_commands: vec![],
-            uses_tools: vec![],
-            exports_mcp_tools: vec![],
-        },
-        "utils" => PluginManifest {
-            id: "utils",
-            handles_events: vec!["slash_command"],
-            slash_commands: vec!["help", "status", "reload", "config"],
-            uses_tools: vec![],
-            exports_mcp_tools: vec![],
-        },
-        "memory" => PluginManifest {
-            id: "memory",
-            handles_events: vec!["slash_command"],
-            slash_commands: vec!["memory"],
-            uses_tools: vec![],
-            exports_mcp_tools: vec![],
-        },
-        "scripting" => PluginManifest {
-            id: "scripting",
-            handles_events: vec!["slash_command"],
-            slash_commands: vec!["kv"],
-            uses_tools: vec![],
-            exports_mcp_tools: vec![],
-        },
-        "todo" => PluginManifest {
-            id: "todo",
-            handles_events: vec!["slash_command"],
-            slash_commands: vec!["todo"],
-            uses_tools: vec![],
-            exports_mcp_tools: vec![],
-        },
-        _ => PluginManifest {
-            id: "",
-            handles_events: vec![],
-            slash_commands: vec![],
-            uses_tools: vec![],
-            exports_mcp_tools: vec![],
-        },
+pub fn plugin_manifest(_plugin_id: &str) -> PluginManifest {
+    PluginManifest {
+        id: String::new(),
+        handles_events: vec![],
+        slash_commands: vec![],
+        uses_tools: vec![],
+        exports_mcp_tools: vec![],
+        execution: PluginExecution::Builtin,
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ExternalPluginManifestFile {
+    id: String,
+    #[serde(default)]
+    handles_events: Vec<String>,
+    #[serde(default)]
+    slash_commands: Vec<SlashCommandDefinition>,
+    #[serde(default)]
+    uses_tools: Vec<String>,
+    #[serde(default, rename = "exports_tools")]
+    exports_mcp_tools: Vec<String>,
+    command: Vec<String>,
+}
+
+fn current_exe_modules_dir() -> Option<PathBuf> {
+    let executable = env::current_exe().ok()?;
+    let root = executable.parent()?.parent()?;
+    let modules_dir = root.join("modules");
+    modules_dir.exists().then_some(modules_dir)
+}
+
+fn repo_modules_dir() -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("modules");
+    path.exists().then_some(path)
+}
+
+fn configured_module_paths(config: &Value) -> Vec<PathBuf> {
+    if let Ok(raw) = env::var("NOODLE_MODULES_PATH") {
+        let items = raw
+            .split(':')
+            .filter(|item| !item.trim().is_empty())
+            .map(expand_home)
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            return items;
+        }
+    }
+
+    let mut paths = Vec::new();
+    if let Some(items) = lookup(config, "modules.paths").and_then(Value::as_array) {
+        for item in items {
+            if let Some(path) = item.as_str() {
+                paths.push(expand_home(path));
+            }
+        }
+    }
+    if paths.is_empty() {
+        if let Some(path) = lookup(config, "modules.path").and_then(Value::as_str) {
+            paths.push(expand_home(path));
+        }
+    }
+    if paths.is_empty() {
+        paths.push(expand_home("~/.noodle/modules"));
+    }
+    if let Some(dev_path) = current_exe_modules_dir() {
+        if !paths.iter().any(|path| path == &dev_path) {
+            paths.push(dev_path);
+        }
+    }
+    if let Some(repo_path) = repo_modules_dir() {
+        if !paths.iter().any(|path| path == &repo_path) {
+            paths.push(repo_path);
+        }
+    }
+    paths
+}
+
+fn expand_module_command_arg(arg: &str, manifest_dir: &Path) -> String {
+    arg.replace("${MODULE_DIR}", &manifest_dir.display().to_string())
+}
+
+fn external_plugin_manifests(config: &Value) -> Vec<PluginManifest> {
+    let mut manifests = Vec::new();
+    for root in configured_module_paths(config) {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let module_dir = entry.path();
+            if !module_dir.is_dir() {
+                continue;
+            }
+            let manifest_path = module_dir.join("manifest.json");
+            let Ok(body) = fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(file) = serde_json::from_str::<ExternalPluginManifestFile>(&body) else {
+                continue;
+            };
+            if file.id.trim().is_empty() || file.command.is_empty() {
+                continue;
+            }
+            let command = file
+                .command
+                .iter()
+                .map(|arg| expand_module_command_arg(arg, &module_dir))
+                .collect::<Vec<_>>();
+            manifests.push(PluginManifest {
+                id: file.id,
+                handles_events: file.handles_events,
+                slash_commands: file.slash_commands,
+                uses_tools: file.uses_tools,
+                exports_mcp_tools: file.exports_mcp_tools,
+                execution: PluginExecution::External {
+                    manifest_path,
+                    command,
+                },
+            });
+        }
+    }
+    manifests
+}
+
+fn plugin_manifest_for_config(config: &Value, plugin_id: &str) -> Option<PluginManifest> {
+    let mut external = external_plugin_manifests(config)
+        .into_iter()
+        .filter(|manifest| manifest.id == plugin_id)
+        .collect::<Vec<_>>();
+    if let Some(manifest) = external.drain(..).next() {
+        return Some(manifest);
+    }
+    let manifest = plugin_manifest(plugin_id);
+    (!manifest.id.is_empty()).then_some(manifest)
+}
+
 pub fn plugin_order(config: &Value) -> Vec<String> {
+    if let Some(items) = lookup(config, "modules.order").and_then(Value::as_array) {
+        let plugins = items
+            .iter()
+            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        if !plugins.is_empty() {
+            return plugins;
+        }
+    }
     if let Some(items) = lookup(config, "plugins.order").and_then(Value::as_array) {
         let plugins = items
             .iter()
@@ -492,8 +574,7 @@ pub fn plugin_order(config: &Value) -> Vec<String> {
 pub fn enabled_plugin_manifests(config: &Value) -> Vec<PluginManifest> {
     plugin_order(config)
         .into_iter()
-        .map(|plugin_id| plugin_manifest(&plugin_id))
-        .filter(|manifest| !manifest.id.is_empty())
+        .filter_map(|plugin_id| plugin_manifest_for_config(config, &plugin_id))
         .collect()
 }
 
@@ -503,70 +584,44 @@ pub fn plugin_matches_request(
     event: &str,
     input: &str,
 ) -> bool {
-    if !manifest.handles_events.iter().any(|item| *item == event) {
+    if !manifest.handles_events.iter().any(|item| item == event) {
         return false;
     }
-    match manifest.id {
-        "chat" => chat_matches_request(config, input),
-        "typos" => true,
-        _ if !manifest.slash_commands.is_empty() => slash_command_matches_request(manifest, input),
-        _ => false,
+    if event == "slash_command" && !manifest.slash_commands.is_empty() {
+        return slash_command_matches_request(manifest, input);
+    }
+    match manifest.id.as_str() {
+        "chat" => {
+            if event == "permission_response" {
+                true
+            } else {
+                chat_matches_request(config, input)
+            }
+        }
+        _ => true,
     }
 }
 
-pub fn slash_command_definition(name: &str) -> Option<SlashCommandDefinition> {
-    match name {
-        "todo" => Some(SlashCommandDefinition {
-            name: "todo",
-            description: "Manage a small terminal todo list stored in noodle memory.",
-            usage: "/todo [list|add|/|x|done|reopen|remove|show|clear-done|help]",
-        }),
-        "help" => Some(SlashCommandDefinition {
-            name: "help",
-            description: "Show available slash commands and usage.",
-            usage: "/help",
-        }),
-        "status" => Some(SlashCommandDefinition {
-            name: "status",
-            description: "Show noodle status, active config, plugins, and permissions.",
-            usage: "/status",
-        }),
-        "reload" => Some(SlashCommandDefinition {
-            name: "reload",
-            description: "Reload noodle runtime config in the current shell.",
-            usage: "/reload",
-        }),
-        "config" => Some(SlashCommandDefinition {
-            name: "config",
-            description: "Inspect or update noodle config from the terminal.",
-            usage: "/config [help|show|get|set|unset] ...",
-        }),
-        "memory" => Some(SlashCommandDefinition {
-            name: "memory",
-            description: "Inspect, search, or clear noodle memory state.",
-            usage: "/memory [help|search|clear] ...",
-        }),
-        "kv" => Some(SlashCommandDefinition {
-            name: "kv",
-            description: "Shared key/value cache for scripting with optional TTL.",
-            usage: "/kv [help|get|set|unset] ...",
-        }),
-        _ => None,
-    }
-}
-
-pub fn registered_slash_command_names(config: &Value) -> Vec<String> {
-    let mut names = Vec::new();
+pub fn registered_slash_command_definitions(config: &Value) -> Vec<SlashCommandDefinition> {
+    let mut definitions = Vec::new();
     for manifest in enabled_plugin_manifests(config) {
         for command in manifest.slash_commands {
-            if slash_command_definition(command).is_some()
-                && !names.iter().any(|item| item == command)
+            if !definitions
+                .iter()
+                .any(|item: &SlashCommandDefinition| item.name == command.name)
             {
-                names.push(command.to_string());
+                definitions.push(command);
             }
         }
     }
-    names
+    definitions
+}
+
+pub fn registered_slash_command_names(config: &Value) -> Vec<String> {
+    registered_slash_command_definitions(config)
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect()
 }
 
 pub fn slash_command_name(input: &str) -> Option<String> {
@@ -587,24 +642,32 @@ pub fn slash_command_matches_request(manifest: &PluginManifest, input: &str) -> 
     manifest
         .slash_commands
         .iter()
-        .any(|command| *command == name)
+        .any(|command| command.name == name)
 }
 
 pub fn tools_for_plugin(config: &Value, plugin_id: &str) -> Vec<ToolDefinition> {
-    let default_manifest = plugin_manifest(plugin_id);
+    let default_manifest =
+        plugin_manifest_for_config(config, plugin_id).unwrap_or(PluginManifest {
+            id: plugin_id.to_string(),
+            handles_events: vec![],
+            slash_commands: vec![],
+            uses_tools: vec![],
+            exports_mcp_tools: vec![],
+            execution: PluginExecution::Builtin,
+        });
     let override_key = format!("plugins.{plugin_id}.uses_tools");
     let tool_names = lookup(config, &override_key)
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| item.as_str())
+                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
                 .collect::<Vec<_>>()
         })
         .unwrap_or(default_manifest.uses_tools.clone());
     let mut enabled = tool_names
         .iter()
-        .map(|name| (*name).to_string())
+        .map(|name| name.to_string())
         .collect::<HashSet<_>>();
     for (tool_name, available) in plugin_tool_availability(config, plugin_id) {
         if available {
@@ -637,7 +700,9 @@ fn plugin_tool_availability(config: &Value, plugin_id: &str) -> HashMap<String, 
 pub fn exported_mcp_tool_names(config: &Value, plugin_order: &[String]) -> Vec<String> {
     let mut names = Vec::new();
     for plugin_id in plugin_order {
-        let manifest = plugin_manifest(plugin_id);
+        let Some(manifest) = plugin_manifest_for_config(config, plugin_id) else {
+            continue;
+        };
         let override_key = format!("plugins.{plugin_id}.exports_tools");
         let exports = lookup(config, &override_key)
             .and_then(Value::as_array)
@@ -652,7 +717,7 @@ pub fn exported_mcp_tool_names(config: &Value, plugin_order: &[String]) -> Vec<S
                 manifest
                     .exports_mcp_tools
                     .iter()
-                    .map(|item| item.to_string())
+                    .map(ToOwned::to_owned)
                     .collect()
             });
         for name in exports {
@@ -1453,7 +1518,7 @@ mod tests {
         let manifests = enabled_plugin_manifests(&config);
         let ids = manifests
             .iter()
-            .map(|manifest| manifest.id)
+            .map(|manifest| manifest.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["typos", "chat"]);
     }

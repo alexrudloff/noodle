@@ -1,0 +1,8 @@
+{
+  "id": "typos",
+  "handles_events": ["command_not_found", "command_error", "typo_selected"],
+  "slash_commands": [],
+  "uses_tools": [],
+  "exports_tools": [],
+  "command": ["python3", "${MODULE_DIR}/module.py"]
+}

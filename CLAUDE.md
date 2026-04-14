@@ -11,7 +11,7 @@ socket.
 
 ## Architecture
 
-Three pieces, one real plugin host:
+Three pieces, one real module host:
 
 1. **`zsh` adapter** (`plugin/noodle.plugin.zsh`) — captures a small set of
    shell events (`oo`, configurable prefix, `command_not_found`, optional
@@ -22,7 +22,7 @@ Three pieces, one real plugin host:
 2. **Rust daemon + client** (`src/`) — single binary `noodle` that:
    - serves a Unix socket (`~/.noodle/noodle.sock`) as `noodle daemon`
    - runs an MCP stdio server as `noodle mcp`
-   - dispatches events to built-in plugins in configured order
+   - dispatches events to configured modules in order
    - owns model provider calls, memory, tool registry, permissions
    - streams live actions to the adapter during long-running work
 3. **Shared SQLite memory** at `~/.noodle/memory.db`, exposing three layers:
@@ -30,9 +30,11 @@ Three pieces, one real plugin host:
    - `state` (derived counters / fast lookups)
    - `artifacts` (compiled memory objects, incl. task records)
 
-Six built-in plugins ship today: `utils`, `memory`, `scripting`, `todo`,
-`chat`, and `typos`. They are all implemented inside the daemon binary itself
-— there is no out-of-process plugin API yet.
+Six first-party modules ship today: `utils`, `memory`, `scripting`, `todo`,
+`chat`, and `typos`. The daemon is now a hybrid host: it can discover packaged
+external modules from `modules/` / `~/.noodle/modules`. All six first-party
+modules now ship as packaged modules. The daemon remains the host for tools,
+permissions, shared memory, task persistence, and provider calls.
 
 ## Key modules
 
@@ -113,6 +115,7 @@ instead of the socket (used by tests and offline tool calls).
 ## Scripts
 
 - `scripts/install.sh` — installs client, plugin, and config to `~/.noodle`;
+  copies packaged modules into `~/.noodle/modules`;
   installs the user launch agent at
   `~/Library/LaunchAgents/com.noodle.daemon.plist`; bootstraps and
   kickstarts the daemon with `launchctl`.
@@ -200,8 +203,8 @@ Rust edition 2024. Single binary crate, no workspace.
 From README "Not done" and observable state:
 
 - Broad `zsh` event forwarding beyond the current small set.
-- Third-party plugin API — today `chat` and `typos` are hard-coded in the
-  daemon binary; there is no out-of-process plugin loader.
+- Third-party module API — the first-party packaged modules work, but the host
+  API is still evolving and not yet a polished public extension contract.
 - Richer daemon lifecycle management (the `launchctl` plist is the entire
   story).
 - Memory linting / maintenance passes.

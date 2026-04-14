@@ -1,0 +1,14 @@
+{
+  "id": "memory",
+  "handles_events": ["slash_command"],
+  "slash_commands": [
+    {
+      "name": "memory",
+      "description": "Inspect, search, or clear noodle memory state.",
+      "usage": "/memory [help|search|clear] ..."
+    }
+  ],
+  "uses_tools": [],
+  "exports_tools": [],
+  "command": ["python3", "${MODULE_DIR}/module.py"]
+}

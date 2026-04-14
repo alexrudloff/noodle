@@ -1,0 +1,27 @@
+{
+  "id": "chat",
+  "handles_events": ["command_not_found", "permission_response"],
+  "slash_commands": [],
+  "uses_tools": [
+    "memory_query",
+    "file_read",
+    "path_search",
+    "glob",
+    "grep",
+    "web_fetch",
+    "web_search",
+    "file_write",
+    "file_edit",
+    "shell_exec",
+    "interactive_shell_start",
+    "interactive_shell_read",
+    "interactive_shell_write",
+    "interactive_shell_key",
+    "interactive_shell_close",
+    "mcp_resource_read",
+    "task_note_write",
+    "agent_handoff_create"
+  ],
+  "exports_tools": ["chat.send"],
+  "command": ["python3", "${MODULE_DIR}/module.py"]
+}

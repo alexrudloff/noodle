@@ -7,6 +7,7 @@ struct PromptSection {
     body: String,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct EventPromptInput<'a> {
     pub mode: &'a str,
     pub template: &'a str,
@@ -50,6 +51,7 @@ pub enum TaskDirectiveContext {
     },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_event_prompt(input: EventPromptInput<'_>) -> String {
     let prompt = input
         .template
@@ -81,6 +83,7 @@ pub fn build_event_prompt(input: EventPromptInput<'_>) -> String {
     render_sections(&sections)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_chat_base_prompt(
     instructions: &str,
     request: &str,
@@ -455,6 +458,7 @@ fn render_tool_catalog(tools: &[ToolDefinition]) -> String {
         .join("\n")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn sanitize_chat_instructions(instructions: &str) -> String {
     let lines = instructions
         .lines()
@@ -469,6 +473,7 @@ fn sanitize_chat_instructions(instructions: &str) -> String {
     lines.join("\n")
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn render_runtime_context(cwd: &str, shell: &str, recent_command: &str) -> String {
     let mut lines = vec![
         format!("Current directory: {cwd}"),

@@ -1,0 +1,14 @@
+{
+  "id": "scripting",
+  "handles_events": ["slash_command"],
+  "slash_commands": [
+    {
+      "name": "kv",
+      "description": "Shared key/value cache for scripting with optional TTL.",
+      "usage": "/kv [help|get|set|unset] ..."
+    }
+  ],
+  "uses_tools": [],
+  "exports_tools": [],
+  "command": ["python3", "${MODULE_DIR}/module.py"]
+}

@@ -18,10 +18,11 @@ cd "${repo_root}"
 cargo build --release
 
 mkdir -p "${install_root}/bin"
-rm -rf "${install_root}/plugin" "${install_root}/config"
+rm -rf "${install_root}/plugin" "${install_root}/config" "${install_root}/modules"
 rm -f "${socket_path}" "${pid_path}"
 cp -R "${repo_root}/plugin" "${install_root}/plugin"
 cp -R "${repo_root}/config" "${install_root}/config"
+cp -R "${repo_root}/modules" "${install_root}/modules"
 cp "${repo_root}/target/release/noodle" "${install_root}/bin/noodle"
 codesign --force --sign - "${install_root}/bin/noodle" >/dev/null 2>&1
 
@@ -321,8 +322,15 @@ brave.setdefault("base_url", "https://api.search.brave.com/res/v1/web/search")
 brave.setdefault("country", "us")
 brave.setdefault("search_lang", "en")
 memory = data.setdefault("memory", {})
+modules = data.setdefault("modules", {})
 todo_memory = memory.setdefault("todo", {})
 todo_memory.setdefault("command_event_limit", 200)
+module_paths = modules.setdefault("paths", ["~/.noodle/modules"])
+if isinstance(module_paths, list):
+    if "~/.noodle/modules" not in module_paths:
+        module_paths.insert(0, "~/.noodle/modules")
+else:
+    modules["paths"] = ["~/.noodle/modules"]
 chat.setdefault("include_tool_context", 0)
 chat.setdefault("tool_calling", 1)
 chat.setdefault("task_execution", 1)
