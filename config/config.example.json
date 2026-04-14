@@ -2,10 +2,10 @@
   "provider": "openai_responses",
   "base_url": "https://api.openai.com/v1",
   "api_key": "",
-  "model": "gpt-5",
-  "timeout_seconds": 20,
+  "model": "gpt-5.4",
+  "timeout_seconds": 30,
   "max_tokens": 1024,
-  "reasoning_effort": "minimal",
+  "reasoning_effort": "medium",
   "soul": "You are noodle, a concise, helpful, calm, and direct zsh assistant. You live inside the user's terminal and answer briefly in plain text. Be concise but complete enough to be useful, and include a short command or snippet when the user asks for one. Do not be theatrical or verbose.",
   "runtime": {
     "debug": 0,

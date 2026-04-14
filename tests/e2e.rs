@@ -770,7 +770,11 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
         "echo noodle-plugin-placeholder\n",
     )
     .unwrap();
-    fs::write(repo_root.join("config/config.example.json"), "{}\n").unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("config/config.example.json"),
+        repo_root.join("config/config.example.json"),
+    )
+    .unwrap();
     fs::write(repo_root.join("modules/.keep"), "").unwrap();
 
     write_executable(
@@ -834,6 +838,9 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
     let config: Value =
         serde_json::from_str(&fs::read_to_string(install_root.join("config.json")).unwrap())
             .unwrap();
+    assert_eq!(config["model"].as_str(), Some("gpt-5.4"));
+    assert_eq!(config["reasoning_effort"].as_str(), Some("medium"));
+    assert_eq!(config["timeout_seconds"].as_i64(), Some(30));
     assert_eq!(config["max_tokens"].as_i64(), Some(1024));
     let chat_tools = config["plugins"]["chat"]["uses_tools"]
         .as_array()

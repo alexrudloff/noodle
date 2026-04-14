@@ -99,7 +99,7 @@ The installer:
 3. Copies packaged modules into `~/.noodle/modules`.
 4. Drops a launch agent at `~/Library/LaunchAgents/com.noodle.daemon.plist`.
 5. Bootstraps and kickstarts the daemon via `launchctl`.
-6. On first run, prompts for provider / model / API key and writes `~/.noodle/config.json`.
+6. On install, prompts for provider / model / API key and writes `~/.noodle/config.json`.
 
 Then add this to your `~/.zshrc`:
 
@@ -120,7 +120,7 @@ Preseed values:
 
 ```sh
 NOODLE_INSTALL_PROVIDER=openai_responses \
-NOODLE_INSTALL_MODEL=gpt-5 \
+NOODLE_INSTALL_MODEL=gpt-5.4 \
 NOODLE_INSTALL_API_KEY=... \
 zsh <(curl -fsSL https://raw.githubusercontent.com/alexrudloff/noodle/main/scripts/install.sh)
 ```
@@ -283,7 +283,7 @@ The canonical example lives at [`config/config.example.json`](config/config.exam
 | `model`                | Model name                                                                  |
 | `max_tokens`           | Max model output tokens                                                     |
 | `reasoning_effort`     | Reasoning level for providers that support it                               |
-| `timeout_seconds`      | HTTP timeout (default `20`)                                                 |
+| `timeout_seconds`      | HTTP timeout (default `30`)                                                 |
 | `soul`                 | High-level assistant identity block included in prompts                     |
 | `debug`                | Legacy; prefer `runtime.debug`                                              |
 

@@ -154,8 +154,8 @@ default_permissions = {
 provider_defaults = {
     "openai_responses": {
         "base_url": "https://api.openai.com/v1",
-        "model": "gpt-5",
-        "reasoning_effort": "minimal",
+        "model": "gpt-5.4",
+        "reasoning_effort": "medium",
     },
     "openai_compatible": {
         "base_url": "",
@@ -245,7 +245,7 @@ def apply_install_overrides(data):
         if value is None:
             continue
         if key == "timeout_seconds":
-            nested_set(data, key, normalize_int(value, 20))
+            nested_set(data, key, normalize_int(value, 30))
         else:
             nested_set(data, key, value)
 
@@ -309,15 +309,6 @@ def maybe_prompt_llm_settings(data, config_created):
     if not prompting_available():
         return
 
-    should_prompt = config_created
-    if mode in {"1", "true", "yes", "on", "always"}:
-        should_prompt = True
-    elif not config_created:
-        should_prompt = prompt_yes_no("Update model/provider settings now?", False)
-
-    if not should_prompt:
-        return
-
     current_provider = nested_get(data, "provider", "openai_responses")
     provider = prompt_choice(
         "Select the model provider for noodle:",
@@ -341,8 +332,7 @@ def maybe_prompt_llm_settings(data, config_created):
         if same_provider
         else defaults["reasoning_effort"]
     ) or defaults["reasoning_effort"]
-    current_timeout = str(nested_get(data, "timeout_seconds", 20) or 20)
-    existing_api_key = nested_get(data, "api_key", "") or ""
+    current_timeout = str(nested_get(data, "timeout_seconds", 30) or 30)
 
     data["provider"] = provider
     if provider == "openai_compatible":
@@ -370,17 +360,10 @@ def maybe_prompt_llm_settings(data, config_created):
             default=current_model or None,
         )
 
-    api_prompt = "API key"
-    if same_provider and existing_api_key:
-        api_prompt += " (leave blank to keep current)"
-    api_key = prompt_text(api_prompt, secret=True, allow_empty=True)
-    if api_key:
-        data["api_key"] = api_key
-    elif not (same_provider and existing_api_key):
-        data["api_key"] = ""
+    data["api_key"] = prompt_required("API key", secret=True)
 
     timeout_value = prompt_text("Timeout seconds", default=current_timeout)
-    data["timeout_seconds"] = normalize_int(timeout_value, 20)
+    data["timeout_seconds"] = normalize_int(timeout_value, 30)
     print(f"Configured noodle for provider={provider} model={data['model']}.")
 
 path = Path(sys.argv[1]).expanduser()
@@ -391,6 +374,9 @@ soul = data.get("soul")
 if not isinstance(soul, str) or not soul.strip():
     data["soul"] = default_soul
 data["max_tokens"] = max(normalize_int(data.get("max_tokens"), 1024), 1024)
+data["timeout_seconds"] = normalize_int(data.get("timeout_seconds"), 30)
+if data["timeout_seconds"] < 30:
+    data["timeout_seconds"] = 30
 
 plugins = data.setdefault("plugins", {})
 chat = plugins.setdefault("chat", {})
