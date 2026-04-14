@@ -820,6 +820,7 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
         .env("PATH", path_env)
         .env("INSTALL_SCRIPT_URL", install_script_url)
         .env("NOODLE_INSTALL_ARCHIVE_URL", archive_url)
+        .env("NOODLE_INSTALL_API_KEY", "\u{1b}sk-install-test")
         .env("NOODLE_INSTALL_ROOT", &install_root)
         .env("NOODLE_LAUNCHCTL_BIN", fake_bin.join("launchctl"))
         .env("NOODLE_INSTALL_CONFIGURE_LLM", "0")
@@ -895,6 +896,7 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
     let config: Value =
         serde_json::from_str(&fs::read_to_string(install_root.join("config.json")).unwrap())
             .unwrap();
+    assert_eq!(config["api_key"].as_str(), Some("sk-install-test"));
     assert_eq!(config["model"].as_str(), Some("gpt-5.4"));
     assert_eq!(config["reasoning_effort"].as_str(), Some("medium"));
     assert_eq!(config["timeout_seconds"].as_i64(), Some(30));

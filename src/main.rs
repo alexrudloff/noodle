@@ -1824,6 +1824,51 @@ fn value_or_env(config: &Value, env_name: &str, key: &str, default: &str) -> Str
     }
 }
 
+fn strip_terminal_control_sequences(input: &str) -> String {
+    let mut cleaned = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    let mut previous_was_escape = false;
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' || (previous_was_escape && next == '\\') {
+                            break;
+                        }
+                        previous_was_escape = next == '\u{1b}';
+                    }
+                }
+                Some(_) => {}
+                None => {}
+            }
+            continue;
+        }
+
+        if ch.is_control() || ch == '\u{7f}' {
+            continue;
+        }
+
+        cleaned.push(ch);
+    }
+
+    cleaned.trim().to_string()
+}
+
+fn sanitized_header_value(value: &str) -> String {
+    strip_terminal_control_sequences(value)
+}
+
 fn value_to_i64(config: &Value, key: &str, default: i64) -> i64 {
     match lookup(config, key) {
         Some(Value::Number(value)) => value.as_i64().unwrap_or(default),
@@ -2901,7 +2946,7 @@ fn call_openai_compatible(config: &Value, prompt: &str, debug: bool) -> Result<S
     if base_url.is_empty() || model.is_empty() {
         return Err("openai_compatible requires base_url and model".into());
     }
-    let api_key = value_or_env(config, "NOODLE_API_KEY", "api_key", "");
+    let api_key = sanitized_header_value(&value_or_env(config, "NOODLE_API_KEY", "api_key", ""));
     let timeout = value_or_env(config, "NOODLE_TIMEOUT_SECONDS", "timeout_seconds", "20")
         .parse::<u64>()
         .unwrap_or(20);
@@ -2939,7 +2984,7 @@ fn call_openai_responses(config: &Value, prompt: &str, debug: bool) -> Result<St
         "https://api.openai.com/v1",
     );
     let model = value_or_env(config, "NOODLE_MODEL", "model", "");
-    let api_key = value_or_env(config, "NOODLE_API_KEY", "api_key", "");
+    let api_key = sanitized_header_value(&value_or_env(config, "NOODLE_API_KEY", "api_key", ""));
     if model.is_empty() || api_key.is_empty() {
         return Err("openai_responses requires model and api_key".into());
     }
@@ -3062,7 +3107,7 @@ fn call_anthropic(config: &Value, prompt: &str, debug: bool) -> Result<String, S
         "https://api.anthropic.com/v1",
     );
     let model = value_or_env(config, "NOODLE_MODEL", "model", "");
-    let api_key = value_or_env(config, "NOODLE_API_KEY", "api_key", "");
+    let api_key = sanitized_header_value(&value_or_env(config, "NOODLE_API_KEY", "api_key", ""));
     if model.is_empty() || api_key.is_empty() {
         return Err("anthropic requires model and api_key".into());
     }
@@ -3139,7 +3184,10 @@ fn request_json_with_headers(
     for (name, value) in extra_headers {
         let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
             .map_err(|err| err.to_string())?;
-        let header_value = HeaderValue::from_str(value).map_err(|err| err.to_string())?;
+        let sanitized_value = sanitized_header_value(value);
+        let header_value = HeaderValue::from_str(&sanitized_value).map_err(|err| {
+            format!("invalid value for header {name}: {err}")
+        })?;
         headers.insert(header_name, header_value);
     }
     let response = client
@@ -3283,6 +3331,7 @@ mod tests {
     use super::{
         broader_local_roots_from_home, call_selector_stub, expanded_max_tokens,
         openai_compatible_response_was_truncated, openai_responses_body_was_truncated,
+        strip_terminal_control_sequences,
     };
     use serde_json::json;
     use std::fs;
@@ -3379,5 +3428,17 @@ mod tests {
         assert_eq!(expanded_max_tokens(512), 1024);
         assert_eq!(expanded_max_tokens(1024), 2048);
         assert_eq!(expanded_max_tokens(2048), 2048);
+    }
+
+    #[test]
+    fn header_sanitizer_removes_terminal_escape_sequences() {
+        assert_eq!(
+            strip_terminal_control_sequences("\u{1b}[O\u{1b}[Isk-proj-test\n"),
+            "sk-proj-test"
+        );
+        assert_eq!(
+            strip_terminal_control_sequences("\u{1b}sk-proj-test"),
+            "sk-proj-test"
+        );
     }
 }

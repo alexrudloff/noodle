@@ -118,7 +118,6 @@ python3 - "${install_root}/config.json" "${config_created}" <<'PY'
 import json
 import os
 import sys
-from getpass import getpass
 from pathlib import Path
 
 default_soul = (
@@ -239,11 +238,49 @@ def normalize_int(value, default):
         return default
 
 
+def sanitize_text(value):
+    if value is None:
+        return None
+    cleaned = []
+    index = 0
+    length = len(value)
+    while index < length:
+        ch = value[index]
+        if ch == "\x1b":
+            index += 1
+            if index >= length:
+                break
+            if value[index] == "[":
+                index += 1
+                while index < length:
+                    next_ch = value[index]
+                    index += 1
+                    if "@" <= next_ch <= "~":
+                        break
+                continue
+            if value[index] == "]":
+                index += 1
+                while index < length:
+                    next_ch = value[index]
+                    index += 1
+                    if next_ch == "\x07":
+                        break
+                    if next_ch == "\x1b" and index < length and value[index] == "\\":
+                        index += 1
+                        break
+                continue
+            continue
+        if ch.isprintable():
+            cleaned.append(ch)
+        index += 1
+    return "".join(cleaned).strip()
+
+
 def install_override(name):
     value = os.environ.get(name)
     if value is None:
         return None
-    return value
+    return sanitize_text(value)
 
 
 def apply_install_overrides(data):
@@ -283,7 +320,7 @@ def prompt_choice(question, options, default_key):
         marker = " (default)" if key == default_key else ""
         print(f"  {index}. {label}{marker}", file=PROMPT_OUTPUT)
     while True:
-        answer = prompt_readline("Choose a provider: ").strip()
+        answer = sanitize_text(prompt_readline("Choose a provider: ")) or ""
         if not answer:
             return default_key
         if answer.isdigit():
@@ -295,12 +332,12 @@ def prompt_choice(question, options, default_key):
                 return key
 
 
-def prompt_text(question, default=None, secret=False, allow_empty=True):
+def prompt_text(question, default=None, allow_empty=True):
     prompt = f"{question}: "
     if default not in (None, ""):
         prompt = f"{question} [{default}]: "
-    value = getpass(prompt, stream=PROMPT_OUTPUT) if secret else prompt_readline(prompt)
-    value = value.strip()
+    value = prompt_readline(prompt)
+    value = sanitize_text(value) or ""
     if value:
         return value
     if default not in (None, ""):
@@ -310,11 +347,18 @@ def prompt_text(question, default=None, secret=False, allow_empty=True):
     return None
 
 
-def prompt_required(question, default=None, secret=False):
+def prompt_required(question, default=None):
     while True:
-        value = prompt_text(question, default=default, secret=secret, allow_empty=False)
+        value = prompt_text(question, default=default, allow_empty=False)
         if value not in (None, ""):
             return value
+
+
+def sanitize_llm_settings(data):
+    for key in ("provider", "base_url", "api_key", "model", "reasoning_effort"):
+        value = data.get(key)
+        if isinstance(value, str):
+            data[key] = sanitize_text(value)
 
 
 def maybe_prompt_llm_settings(data, config_created):
@@ -375,7 +419,7 @@ def maybe_prompt_llm_settings(data, config_created):
             default=current_model or None,
         )
 
-    data["api_key"] = prompt_required("API key", secret=True)
+    data["api_key"] = prompt_required("API key")
 
     timeout_value = prompt_text("Timeout seconds", default=current_timeout)
     data["timeout_seconds"] = normalize_int(timeout_value, 30)
@@ -384,6 +428,7 @@ def maybe_prompt_llm_settings(data, config_created):
 path = Path(sys.argv[1]).expanduser()
 config_created = sys.argv[2] == "1"
 data = json.loads(path.read_text())
+sanitize_llm_settings(data)
 soul = data.get("soul")
 
 if not isinstance(soul, str) or not soul.strip():
