@@ -41,9 +41,183 @@ impl Drop for TempDir {
     }
 }
 
+fn write_mock_mcp_server(temp: &TempDir) -> PathBuf {
+    let path = temp.path().join("mock_mcp_server.py");
+    fs::write(
+        &path,
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+counter = 0
+mode = sys.argv[1] if len(sys.argv) > 1 else "content_length"
+
+
+def read_message():
+    if mode == "ndjson":
+        while True:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return None
+            line = line.decode("utf-8").strip()
+            if line:
+                return json.loads(line)
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("utf-8").split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    if not body:
+        return None
+    return json.loads(body.decode("utf-8"))
+
+
+def send(message):
+    if mode == "ndjson":
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
+        return
+    body = json.dumps(message).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+
+def ok(request_id, result):
+    send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
+def error(request_id, code, message):
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": code, "message": message},
+        }
+    )
+
+
+while True:
+    request = read_message()
+    if request is None:
+        break
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+
+    if method == "initialize":
+        ok(
+            request_id,
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "resources": {"listChanged": False},
+                },
+                "serverInfo": {"name": "mock-docs", "version": "1.0.0"},
+            },
+        )
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        ok(
+            request_id,
+            {
+                "tools": [
+                    {
+                        "name": "echo",
+                        "description": "Echo text back from the MCP server.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    {
+                        "name": "counter",
+                        "description": "Return an incrementing counter.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": False,
+                        },
+                    },
+                ]
+            },
+        )
+    elif method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if name == "echo":
+            text = arguments.get("text", "")
+            ok(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": f"echo:{text}"}],
+                    "isError": False,
+                },
+            )
+        elif name == "counter":
+            counter += 1
+            ok(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": f"counter:{counter}"}],
+                    "isError": False,
+                },
+            )
+        else:
+            error(request_id, -32601, f"unknown tool: {name}")
+    elif method == "resources/list":
+        ok(
+            request_id,
+            {
+                "resources": [
+                    {
+                        "uri": "memory://summary",
+                        "name": "Summary",
+                        "mimeType": "text/plain",
+                    }
+                ]
+            },
+        )
+    elif method == "resources/read":
+        uri = params.get("uri")
+        if uri == "memory://summary":
+            ok(
+                request_id,
+                {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "text/plain",
+                            "text": "memory summary",
+                        }
+                    ]
+                },
+            )
+        else:
+            error(request_id, -32001, f"unknown resource: {uri}")
+    else:
+        if request_id is not None:
+            error(request_id, -32601, f"method not found: {method}")
+"#,
+    )
+    .unwrap();
+    path
+}
+
 fn write_test_config(temp: &TempDir, selection_mode: &str) -> PathBuf {
     let config_path = temp.path().join("config.json");
     let memory_path = temp.path().join("memory.db");
+    let mock_mcp_server = write_mock_mcp_server(temp);
     let modules_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("modules")
         .display()
@@ -163,6 +337,21 @@ fn write_test_config(temp: &TempDir, selection_mode: &str) -> PathBuf {
                 "search_lang": "en"
             }
         },
+        "mcp": {
+            "servers": {
+                "docs": {
+                    "command": ["python3", mock_mcp_server.display().to_string()],
+                    "request_timeout_ms": 5000,
+                    "startup_timeout_ms": 5000
+                },
+                "docs_ndjson": {
+                    "command": ["python3", mock_mcp_server.display().to_string(), "ndjson"],
+                    "message_format": "ndjson",
+                    "request_timeout_ms": 5000,
+                    "startup_timeout_ms": 5000
+                }
+            }
+        },
         "memory": {
             "path": memory_path.to_string_lossy().to_string(),
             "chat": {
@@ -228,6 +417,9 @@ fn write_test_config(temp: &TempDir, selection_mode: &str) -> PathBuf {
                     "interactive_shell_write",
                     "interactive_shell_key",
                     "interactive_shell_close",
+                    "mcp_tools_list",
+                    "mcp_tool_call",
+                    "mcp_resources_list",
                     "mcp_resource_read",
                     "task_note_write",
                     "agent_handoff_create"
@@ -278,6 +470,10 @@ fn write_test_config(temp: &TempDir, selection_mode: &str) -> PathBuf {
 }
 
 fn run_zsh(temp: &TempDir, config: &Path, script: &str) -> String {
+    strip_ansi(&run_zsh_raw(temp, config, script))
+}
+
+fn run_zsh_raw(temp: &TempDir, config: &Path, script: &str) -> String {
     let socket = temp.path().join("noodle.sock");
     let pidfile = temp.path().join("noodle.pid");
     let output = Command::new("/bin/zsh")
@@ -303,7 +499,7 @@ fn run_zsh(temp: &TempDir, config: &Path, script: &str) -> String {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    strip_ansi(&combined)
+    combined
 }
 
 fn kill_daemon(pidfile: &Path, socket: &Path) {
@@ -1722,6 +1918,63 @@ fn permission_request_can_resume_planned_write() {
 }
 
 #[test]
+fn permission_request_reuses_same_mcp_tool_for_rest_of_task() {
+    let temp = TempDir::new("noodle-e2e-permission-mcp-tool");
+    let config = write_test_config(&temp, "auto");
+    prepend_stub_matchers(
+        &config,
+        vec![
+            json!({
+                "contains": "content_text:\ncounter:2",
+                "response": "FINAL: counter:2"
+            }),
+            json!({
+                "contains": "content_text:\ncounter:1",
+                "response": "TOOL: mcp_tool_call {\"server\":\"docs\",\"tool\":\"counter\",\"arguments\":{}}"
+            }),
+            json!({
+                "contains": "[Current Request]\nuse the docs mcp counter twice",
+                "response": "TOOL: mcp_tool_call {\"server\":\"docs\",\"tool\":\"counter\",\"arguments\":{}}"
+            }),
+        ],
+    );
+
+    let first = run_mode(
+        &temp,
+        &config,
+        "command_not_found",
+        "oo use the docs mcp counter twice",
+        None,
+    );
+    assert_eq!(first["action"].as_str(), Some("permission_request"));
+    assert_eq!(first["tool"].as_str(), Some("mcp_tool_call"));
+    let permission_id = first["permission_id"].as_str().unwrap().to_string();
+
+    let resumed = run_mode(
+        &temp,
+        &config,
+        "permission_response",
+        &permission_id,
+        Some("allow"),
+    );
+    assert_eq!(resumed["action"].as_str(), Some("batch"));
+    let items = resumed["items"].as_array().unwrap();
+    assert!(
+        !items
+            .iter()
+            .any(|item| item["action"].as_str() == Some("permission_request")),
+        "expected mcp_tool_call approval to persist within the task, got:\n{}",
+        serde_json::to_string_pretty(&resumed).unwrap()
+    );
+    assert_eq!(
+        last_batch_action(&resumed).and_then(|item| item["message"].as_str()),
+        Some("counter:2"),
+        "expected second counter call to stay on the same MCP session, got:\n{}",
+        serde_json::to_string_pretty(&resumed).unwrap()
+    );
+}
+
+#[test]
 fn permission_request_can_be_denied() {
     let temp = TempDir::new("noodle-e2e-permission-deny");
     let config = write_test_config(&temp, "auto");
@@ -1899,6 +2152,39 @@ fn zsh_renders_multiline_slash_command_messages_as_single_avatar_blocks() {
 }
 
 #[test]
+fn zsh_restores_cursor_after_terminal_cleanup() {
+    let temp = TempDir::new("noodle-zsh-terminal-restore");
+    let config = write_test_config(&temp, "auto");
+
+    let output = run_zsh_raw(
+        &temp,
+        &config,
+        "NOODLE_RAW_SESSION_OUTPUT_ACTIVE=1; NOODLE_TERMINAL_NEEDS_RESET=1; _noodle_finish_raw_output_if_needed",
+    );
+    assert!(
+        output.contains("\u{1b}[0m\u{1b}[?25h\n"),
+        "expected terminal reset and cursor restore, got:\n{:?}",
+        output
+    );
+}
+
+#[test]
+fn zsh_restores_cursor_when_stream_helper_is_interrupted() {
+    let temp = TempDir::new("noodle-zsh-interrupt-restore");
+    let config = write_test_config(&temp, "auto");
+    let combined = run_zsh_raw(
+        &temp,
+        &config,
+        "NOODLE_STATUS_LINE_ACTIVE=1; NOODLE_TERMINAL_NEEDS_RESET=1; kill -INT $$",
+    );
+    assert!(
+        combined.contains("\u{1b}[?25h"),
+        "expected cursor restore on interrupt, got:\n{:?}",
+        combined
+    );
+}
+
+#[test]
 fn daemon_exposes_tool_registry_and_builtin_tool_calls() {
     let temp = TempDir::new("noodle-e2e-tools");
     let config = write_test_config(&temp, "auto");
@@ -1934,6 +2220,9 @@ fn daemon_exposes_tool_registry_and_builtin_tool_calls() {
         "interactive_shell_write",
         "interactive_shell_key",
         "interactive_shell_close",
+        "mcp_tools_list",
+        "mcp_tool_call",
+        "mcp_resources_list",
         "mcp_resource_read",
         "task_note_write",
         "agent_handoff_create",
@@ -1959,6 +2248,47 @@ fn daemon_exposes_tool_registry_and_builtin_tool_calls() {
         tool_call["output"]["content"].as_str() == Some("hello from tool"),
         "expected file_read tool result, got:\n{}",
         tool_call
+    );
+}
+
+#[test]
+fn module_api_info_reports_versioned_host_contract() {
+    let temp = TempDir::new("noodle-e2e-module-api-info");
+    let socket = temp.path().join("noodle.sock");
+    let pidfile = temp.path().join("noodle.pid");
+    let output = Command::new(noodle_bin())
+        .arg("module-api")
+        .arg("info")
+        .env("HOME", temp.path())
+        .env("NOODLE_SOCKET", &socket)
+        .env("NOODLE_PIDFILE", &pidfile)
+        .env("NOODLE_BYPASS_DAEMON", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "module-api info failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["version"].as_str(), Some("v1"));
+    assert_eq!(payload["command_prefix"][1].as_str(), Some("module-api"));
+    let capabilities = payload["capabilities"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        capabilities
+            .iter()
+            .any(|item| item.as_str() == Some("execution_run")),
+        "{payload}"
+    );
+    assert!(
+        capabilities
+            .iter()
+            .any(|item| item.as_str() == Some("tool_batch")),
+        "{payload}"
     );
 }
 
@@ -2370,19 +2700,115 @@ fn all_builtin_primitives_are_covered_and_work() {
         raw_results[3]
     );
 
+    let mcp_tools_list = run_tool(&temp, &config, "mcp_tools_list", json!({"server": "docs"}));
+    let mcp_tools = mcp_tools_list["output"]["tools"].as_array().unwrap();
+    assert!(
+        mcp_tools
+            .iter()
+            .any(|item| item["name"].as_str() == Some("echo"))
+    );
+    assert!(
+        mcp_tools
+            .iter()
+            .any(|item| item["name"].as_str() == Some("counter"))
+    );
+
+    let mcp_resources_list = run_tool(
+        &temp,
+        &config,
+        "mcp_resources_list",
+        json!({"server": "docs"}),
+    );
+    let mcp_resources = mcp_resources_list["output"]["resources"]
+        .as_array()
+        .unwrap();
+    assert!(
+        mcp_resources
+            .iter()
+            .any(|item| item["uri"].as_str() == Some("memory://summary"))
+    );
+
     let mcp_resource_read = run_tool(
         &temp,
         &config,
         "mcp_resource_read",
-        json!({
-            "server": "docs",
-            "uri": "memory://summary",
-            "_stub": { "mcp_resource_read": { "docs|memory://summary": "memory summary" } }
-        }),
+        json!({"server": "docs", "uri": "memory://summary"}),
     );
     assert_eq!(
         mcp_resource_read["output"]["content"].as_str(),
         Some("memory summary")
+    );
+
+    let mcp_tool_batch = run_tool_batch(
+        &temp,
+        &config,
+        json!([
+            {
+                "tool": "mcp_tool_call",
+                "args": {
+                    "server": "docs",
+                    "tool": "echo",
+                    "arguments": { "text": "hello" }
+                }
+            },
+            {
+                "tool": "mcp_tool_call",
+                "args": {
+                    "server": "docs",
+                    "tool": "counter",
+                    "arguments": {}
+                }
+            },
+            {
+                "tool": "mcp_tool_call",
+                "args": {
+                    "server": "docs",
+                    "tool": "counter",
+                    "arguments": {}
+                }
+            }
+        ]),
+    );
+    let mcp_tool_results = mcp_tool_batch["results"].as_array().unwrap();
+    assert_eq!(
+        mcp_tool_results[0]["output"]["content_text"].as_str(),
+        Some("echo:hello")
+    );
+    assert_eq!(
+        mcp_tool_results[1]["output"]["content_text"].as_str(),
+        Some("counter:1")
+    );
+    assert_eq!(
+        mcp_tool_results[2]["output"]["content_text"].as_str(),
+        Some("counter:2")
+    );
+
+    let mcp_tools_list_ndjson = run_tool(
+        &temp,
+        &config,
+        "mcp_tools_list",
+        json!({"server": "docs_ndjson"}),
+    );
+    let mcp_tools_ndjson = mcp_tools_list_ndjson["output"]["tools"].as_array().unwrap();
+    assert!(
+        mcp_tools_ndjson
+            .iter()
+            .any(|item| item["name"].as_str() == Some("echo"))
+    );
+
+    let mcp_tool_call_ndjson = run_tool(
+        &temp,
+        &config,
+        "mcp_tool_call",
+        json!({
+            "server": "docs_ndjson",
+            "tool": "echo",
+            "arguments": { "text": "ndjson" }
+        }),
+    );
+    assert_eq!(
+        mcp_tool_call_ndjson["output"]["content_text"].as_str(),
+        Some("echo:ndjson")
     );
 
     let task_note_write = run_tool(
@@ -2453,6 +2879,8 @@ fn chat_tool_harness_prints_model_selected_tools_and_results() {
             "oo run printf harness-shell-ok in the harness folder",
             "shell_exec",
         ),
+        ("oo list the MCP tools on docs", "mcp_tools_list"),
+        ("oo call the echo tool on docs with hello", "mcp_tool_call"),
         (
             "oo read the MCP memory summary resource from docs",
             "mcp_resource_read",

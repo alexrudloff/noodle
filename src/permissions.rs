@@ -17,6 +17,8 @@ pub struct ChatExecutionSnapshot {
     pub max_tool_rounds: usize,
     pub max_replans: usize,
     pub available_tool_names: Vec<String>,
+    #[serde(default)]
+    pub granted_tool_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

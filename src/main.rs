@@ -26,8 +26,10 @@ use std::time::{Duration, SystemTime};
 use tooling::{
     PluginExecution, ToolDefinition, enabled_plugin_manifests, exported_mcp_tools,
     invoke_builtin_tool, plugin_matches_request, plugin_order, registered_slash_command_names,
-    tools_for_plugin,
+    shutdown_all_mcp_sessions, tools_for_plugin,
 };
+
+const MODULE_API_VERSION: &str = "v1";
 
 #[derive(Clone)]
 struct CachedConfig {
@@ -60,6 +62,7 @@ enum Command {
     PayloadFields {
         payload: Option<String>,
     },
+    ModuleApiInfo,
     ModelOutput {
         config: String,
         prompt: Option<String>,
@@ -162,6 +165,7 @@ struct DaemonResponse {
 
 #[derive(Debug, Serialize)]
 struct ExternalPluginRequest<'a> {
+    api_version: &'static str,
     event: &'a str,
     input: &'a str,
     cwd: &'a str,
@@ -179,9 +183,17 @@ struct ExternalPluginRequest<'a> {
 #[derive(Debug, Serialize)]
 struct ExternalHostInfo {
     binary_path: String,
+    module_api: ExternalModuleApiInfo,
     module_order: Vec<String>,
     slash_commands: Vec<tooling::SlashCommandDefinition>,
     tool_counts: HashMap<String, usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExternalModuleApiInfo {
+    version: &'static str,
+    command_prefix: Vec<String>,
+    capabilities: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,6 +255,7 @@ fn run() -> Result<(), String> {
         | Command::ExecutionRun { stream: true, .. }
         | Command::ExecutionResumePermission { stream: true, .. } => execute_streaming(command),
         Command::PayloadFields { .. }
+        | Command::ModuleApiInfo
         | Command::ModelOutput { .. }
         | Command::MemoryContext { .. }
         | Command::MemoryRecordTurns { .. }
@@ -270,6 +283,7 @@ fn parse_args() -> Result<Command, String> {
         "daemon" => Ok(Command::Daemon {
             socket: optional_flag(&args[1..], "--socket").unwrap_or_else(default_socket_path),
         }),
+        "module-api" => parse_module_api_args(&args[1..]),
         "runtime-config" => Ok(Command::RuntimeConfig {
             config: require_flag(&args[1..], "--config")?,
         }),
@@ -371,6 +385,61 @@ fn parse_args() -> Result<Command, String> {
     }
 }
 
+fn parse_module_api_args(args: &[String]) -> Result<Command, String> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return Err("module-api requires a subcommand".into());
+    };
+    match subcommand {
+        "info" => Ok(Command::ModuleApiInfo),
+        "model-output" => Ok(Command::ModelOutput {
+            config: require_flag(&args[1..], "--config")?,
+            prompt: optional_flag(&args[1..], "--prompt"),
+            debug: args.iter().any(|arg| arg == "--debug"),
+        }),
+        "execution-run" => Ok(Command::ExecutionRun {
+            config: require_flag(&args[1..], "--config")?,
+            request_json: optional_flag(&args[1..], "--request"),
+            debug: args.iter().any(|arg| arg == "--debug"),
+            stream: args.iter().any(|arg| arg == "--stream"),
+        }),
+        "execution-resume-permission" => Ok(Command::ExecutionResumePermission {
+            config: require_flag(&args[1..], "--config")?,
+            permission_id: require_flag(&args[1..], "--permission-id")?,
+            decision: require_flag(&args[1..], "--decision")?,
+            debug: args.iter().any(|arg| arg == "--debug"),
+            stream: args.iter().any(|arg| arg == "--stream"),
+        }),
+        "memory-context" => Ok(Command::MemoryContext {
+            config: require_flag(&args[1..], "--config")?,
+            plugin: require_flag(&args[1..], "--plugin")?,
+        }),
+        "memory-record-turns" => Ok(Command::MemoryRecordTurns {
+            config: require_flag(&args[1..], "--config")?,
+            plugin: require_flag(&args[1..], "--plugin")?,
+            user_text: require_flag(&args[1..], "--user-text")?,
+            payload_json: optional_flag(&args[1..], "--payload"),
+            debug: args.iter().any(|arg| arg == "--debug"),
+        }),
+        "workspace-context" => Ok(Command::WorkspaceContext {
+            cwd: require_flag(&args[1..], "--cwd")?,
+        }),
+        "tool-list" => Ok(Command::ToolList {
+            config: require_flag(&args[1..], "--config")?,
+            plugin: optional_flag(&args[1..], "--plugin").unwrap_or_else(|| "chat".into()),
+        }),
+        "tool-call" => Ok(Command::ToolCall {
+            config: require_flag(&args[1..], "--config")?,
+            tool: require_flag(&args[1..], "--tool")?,
+            args_json: optional_flag(&args[1..], "--args").unwrap_or_else(|| "{}".into()),
+        }),
+        "tool-batch" => Ok(Command::ToolBatch {
+            config: require_flag(&args[1..], "--config")?,
+            calls_json: optional_flag(&args[1..], "--calls").unwrap_or_else(|| "[]".into()),
+        }),
+        other => Err(format!("unknown module-api subcommand: {other}")),
+    }
+}
+
 fn optional_flag(args: &[String], flag: &str) -> Option<String> {
     args.windows(2).find_map(|window| {
         if window[0] == flag {
@@ -397,6 +466,30 @@ fn default_memory_path() -> String {
     env::var("NOODLE_MEMORY_DB").unwrap_or_else(|_| "~/.noodle/memory.db".into())
 }
 
+fn module_api_capabilities() -> Vec<String> {
+    vec![
+        "info".into(),
+        "stream_envelopes_v1".into(),
+        "model_output".into(),
+        "execution_run".into(),
+        "execution_resume_permission".into(),
+        "memory_context".into(),
+        "memory_record_turns".into(),
+        "workspace_context".into(),
+        "tool_list".into(),
+        "tool_call".into(),
+        "tool_batch".into(),
+    ]
+}
+
+fn module_api_info_json(binary_path: &str) -> Value {
+    json!({
+        "version": MODULE_API_VERSION,
+        "command_prefix": [binary_path, "module-api"],
+        "capabilities": module_api_capabilities(),
+    })
+}
+
 fn execute_via_daemon(command: Command) -> Result<String, String> {
     if env::var("NOODLE_BYPASS_DAEMON").ok().as_deref() == Some("1") {
         return execute_local(command);
@@ -404,6 +497,7 @@ fn execute_via_daemon(command: Command) -> Result<String, String> {
     if matches!(
         command,
         Command::PayloadFields { .. }
+            | Command::ModuleApiInfo
             | Command::ModelOutput { .. }
             | Command::ExecutionRun { .. }
             | Command::ExecutionResumePermission { .. }
@@ -509,6 +603,7 @@ fn execution_request_from_json(
             .max_replans
             .unwrap_or_else(|| engine::plugin_max_replans(config, plugin)),
         available_tools: engine::plugin_tools_for_config(config, plugin),
+        granted_tool_names: Vec::new(),
     })
 }
 
@@ -1006,7 +1101,8 @@ fn to_request(command: Command) -> DaemonRequest {
             limit: None,
             stream: None,
         },
-        Command::ModelOutput { .. }
+        Command::ModuleApiInfo
+        | Command::ModelOutput { .. }
         | Command::ExecutionRun { .. }
         | Command::ExecutionResumePermission { .. }
         | Command::MemoryContext { .. }
@@ -1212,7 +1308,8 @@ fn from_request(request: DaemonRequest) -> Command {
         "payload-fields" => Command::PayloadFields {
             payload: request.payload,
         },
-        "model-output"
+        "module-api-info"
+        | "model-output"
         | "execution-run"
         | "execution-resume-permission"
         | "memory-context"
@@ -1279,7 +1376,7 @@ fn from_request(request: DaemonRequest) -> Command {
 }
 
 fn execute_local(command: Command) -> Result<String, String> {
-    match command {
+    let result = match command {
         Command::RuntimeConfig { config } => {
             let config = load_config(&config);
             Ok(render_runtime_config(&config))
@@ -1311,6 +1408,14 @@ fn execute_local(command: Command) -> Result<String, String> {
         Command::PayloadFields { payload } => {
             let payload = read_optional_text(payload)?;
             render_payload_fields(&payload)
+        }
+        Command::ModuleApiInfo => {
+            let binary_path = env::current_exe()
+                .ok()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "noodle".into());
+            serde_json::to_string(&module_api_info_json(&binary_path))
+                .map_err(|err| err.to_string())
         }
         Command::ModelOutput {
             config,
@@ -1493,14 +1598,15 @@ fn execute_local(command: Command) -> Result<String, String> {
         }
         Command::Mcp => unreachable!(),
         Command::Daemon { .. } => unreachable!(),
-    }
+    };
+    finalize_local_command(result)
 }
 
 fn execute_local_stream(
     command: Command,
     emit_line: &mut dyn FnMut(String) -> Result<(), String>,
 ) -> Result<(), String> {
-    match command {
+    let result = match command {
         Command::Run {
             mode,
             input,
@@ -1577,6 +1683,15 @@ fn execute_local_stream(
             let output = execute_local(other)?;
             emit_line(output)
         }
+    };
+    finalize_local_command(result)
+}
+
+fn finalize_local_command<T>(result: Result<T, String>) -> Result<T, String> {
+    let cleanup = shutdown_all_mcp_sessions();
+    match result {
+        Ok(value) => cleanup.map(|_| value),
+        Err(err) => Err(err),
     }
 }
 
@@ -2202,11 +2317,17 @@ fn external_host_info(config: &Value) -> ExternalHostInfo {
         .iter()
         .map(|plugin| (plugin.clone(), tools_for_plugin(config, plugin).len()))
         .collect::<HashMap<_, _>>();
+    let binary_path = env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "noodle".into());
     ExternalHostInfo {
-        binary_path: env::current_exe()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "noodle".into()),
+        binary_path: binary_path.clone(),
+        module_api: ExternalModuleApiInfo {
+            version: MODULE_API_VERSION,
+            command_prefix: vec![binary_path.clone(), "module-api".into()],
+            capabilities: module_api_capabilities(),
+        },
         module_order,
         slash_commands,
         tool_counts,
@@ -2237,6 +2358,7 @@ fn spawn_external_plugin(
         .first()
         .ok_or_else(|| format!("external plugin {} has no command", manifest.id))?;
     let request = ExternalPluginRequest {
+        api_version: MODULE_API_VERSION,
         event,
         input,
         cwd,
@@ -2733,9 +2855,15 @@ STEP: shell_exec {"command":"printf harness-shell-ok","cwd":"harness"}"#
     } else if lowered.contains("talk to the interactive harness and tell it alex") {
         r#"PLAN: interactive harness session
 STEP: interactive_shell_start {"command":"printf 'name? '; read name; printf 'hi:%s' $name"}"#
+    } else if lowered.contains("list the mcp tools on docs") {
+        r#"PLAN: list mcp tools
+STEP: mcp_tools_list {"server":"docs"}"#
+    } else if lowered.contains("call the echo tool on docs with hello") {
+        r#"PLAN: call mcp echo tool
+STEP: mcp_tool_call {"server":"docs","tool":"echo","arguments":{"text":"hello"}}"#
     } else if lowered.contains("read the mcp memory summary resource from docs") {
         r#"PLAN: read mcp resource
-STEP: mcp_resource_read {"server":"docs","uri":"memory://summary","_stub":{"mcp_resource_read":{"docs|memory://summary":"memory summary"}}}"#
+STEP: mcp_resource_read {"server":"docs","uri":"memory://summary"}"#
     } else if lowered.contains("save a task note called harness_note saying ship noodle") {
         r#"PLAN: write task note
 STEP: task_note_write {"kind":"harness_note","content":"ship noodle"}"#

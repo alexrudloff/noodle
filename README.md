@@ -19,7 +19,7 @@
 ![memory](https://img.shields.io/badge/memory-SQLite-003b57?style=flat-square)
 ![mcp](https://img.shields.io/badge/protocol-MCP-6b46c1?style=flat-square)
 
-[Install](#install) · [Quick Start](#quick-start) · [Modules](#modules) · [Tools](#built-in-tools) · [Config](#configuration) · [MCP](#tasks--mcp)
+[Install](#install) · [Quick Start](#quick-start) · [Modules](#modules) · [Module API](#module-api) · [Tools](#built-in-tools) · [Config](#configuration) · [MCP](#tasks--mcp)
 
 </div>
 
@@ -66,6 +66,7 @@ oo what changed in this repo?
 
 # Direct CLI
 ~/.noodle/bin/noodle tool-list --config ~/.noodle/config.json --plugin chat
+~/.noodle/bin/noodle module-api info
 ~/.noodle/bin/noodle task-list --config ~/.noodle/config.json
 ~/.noodle/bin/noodle mcp
 ```
@@ -167,6 +168,18 @@ Six first-party modules ship in the box. They split by job: some are determinist
 | [`typos`](docs/plugins/typos/README.md)       | Typo recovery for `command not found` and optional command-error fallback.      | `git stauts` → `git status`                      |
 
 Each module has its own README with behavior, commands, and config.
+
+## Module API
+
+Third-party modules should target the explicit versioned host contract, not the
+current first-party implementation details.
+
+- Module manifests now declare `api_version: "v1"`.
+- The host sends a request object with `api_version: "v1"` and
+  `host.module_api`.
+- Module callbacks into the host should go through `noodle module-api ...`.
+
+The full contract is documented in [docs/module-api-v1.md](docs/module-api-v1.md).
 
 ---
 
@@ -436,6 +449,7 @@ src/actions.rs                 DaemonAction enum streamed back to the adapter
 src/permissions.rs             permission class resolution
 modules/*/manifest.json        packaged module manifests discovered by the daemon
 modules/*/module.py            first-party external module entrypoints
+docs/module-api-v1.md          versioned host contract for third-party modules
 config/config.example.json     example configuration
 docs/plugins/*/README.md       per-module docs
 ```

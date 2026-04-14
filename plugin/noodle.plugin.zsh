@@ -34,6 +34,8 @@ typeset -g NOODLE_SELECTION_MODE_OVERRIDE="${NOODLE_SELECTION_MODE-__NOODLE_UNSE
 typeset -g NOODLE_SLASH_COMMANDS_OVERRIDE="${NOODLE_SLASH_COMMANDS-__NOODLE_UNSET__}"
 typeset -g NOODLE_CHAT_PREFIX_OVERRIDE="${NOODLE_CHAT_PREFIX-__NOODLE_UNSET__}"
 typeset -g NOODLE_RAW_SESSION_OUTPUT_ACTIVE=0
+typeset -g NOODLE_STATUS_LINE_ACTIVE=0
+typeset -g NOODLE_TERMINAL_NEEDS_RESET=0
 typeset -g NOODLE_PENDING_SLASH_COMMAND=""
 
 function _noodle_reset_runtime_config() {
@@ -154,9 +156,27 @@ function _noodle_avatar_render() {
   fi
 }
 
+function _noodle_restore_terminal_state() {
+  emulate -L zsh
+  if (( NOODLE_STATUS_LINE_ACTIVE )); then
+    printf '\r\033[2K' >&2
+    NOODLE_STATUS_LINE_ACTIVE=0
+  fi
+  if (( NOODLE_RAW_SESSION_OUTPUT_ACTIVE )); then
+    printf '\033[0m\033[?25h\n' >&2
+    NOODLE_RAW_SESSION_OUTPUT_ACTIVE=0
+    NOODLE_TERMINAL_NEEDS_RESET=0
+    return 0
+  fi
+  if (( NOODLE_TERMINAL_NEEDS_RESET )); then
+    printf '\033[0m\033[?25h' >&2
+    NOODLE_TERMINAL_NEEDS_RESET=0
+  fi
+}
+
 function _noodle_avatar_clear() {
   emulate -L zsh
-  printf '\r\033[2K' >&2
+  _noodle_restore_terminal_state
 }
 
 function _noodle_avatar_play() {
@@ -164,6 +184,8 @@ function _noodle_avatar_play() {
   local delay="$1"
   shift
   local frame
+  NOODLE_STATUS_LINE_ACTIVE=1
+  NOODLE_TERMINAL_NEEDS_RESET=1
   for frame in "$@"; do
     _noodle_avatar_render "$frame"
     sleep "$delay"
@@ -178,6 +200,8 @@ function _noodle_avatar_wait() {
   local dots=("" "." ".." "...")
   local i=1
   local j=1
+  NOODLE_STATUS_LINE_ACTIVE=1
+  NOODLE_TERMINAL_NEEDS_RESET=1
   while kill -0 "$pid" 2>/dev/null; do
     _noodle_avatar_render "${frames[i]}" "${dots[j]}"
     i=$(( (i % ${#frames}) + 1 ))
@@ -193,6 +217,8 @@ function _noodle_avatar_spin() {
   local dots=("" "." ".." "...")
   local i=1
   local j=1
+  NOODLE_STATUS_LINE_ACTIVE=1
+  NOODLE_TERMINAL_NEEDS_RESET=1
   while true; do
     _noodle_avatar_render "${frames[i]}" "${dots[j]}"
     i=$(( (i % ${#frames}) + 1 ))
@@ -266,9 +292,8 @@ function _noodle_transcript_line() {
 
 function _noodle_finish_raw_output_if_needed() {
   emulate -L zsh
-  if (( NOODLE_RAW_SESSION_OUTPUT_ACTIVE )); then
-    printf '\033[0m\n' >&2
-    NOODLE_RAW_SESSION_OUTPUT_ACTIVE=0
+  if (( NOODLE_RAW_SESSION_OUTPUT_ACTIVE || NOODLE_TERMINAL_NEEDS_RESET || NOODLE_STATUS_LINE_ACTIVE )); then
+    _noodle_restore_terminal_state
   fi
 }
 
@@ -286,7 +311,7 @@ function _noodle_decode_field() {
 
 function _noodle_call_helper() {
   emulate -L zsh
-  setopt local_options pipefail no_aliases no_bg_nice no_monitor
+  setopt local_options pipefail no_aliases no_bg_nice no_monitor localtraps
   _noodle_ensure_daemon || return 1
   local mode="$1"
   local input="$2"
@@ -294,6 +319,18 @@ function _noodle_call_helper() {
   local selected_command="${4:-}"
   local tmp
   tmp="$(mktemp "${TMPDIR:-/tmp}/noodle.XXXXXX")" || return 1
+  local pid=""
+
+  trap '
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      pid=""
+    fi
+    rm -f "$tmp" "$tmp.stderr"
+    _noodle_restore_terminal_state
+    return 130
+  ' INT TERM
 
   "$NOODLE_HELPER" \
     --mode "$mode" \
@@ -305,10 +342,11 @@ function _noodle_call_helper() {
     --selected-command "$(_noodle_escape_arg "$selected_command")" \
     --config "$NOODLE_CONFIG" \
     >"$tmp" 2>"$tmp.stderr" &
-  local pid=$!
+  pid=$!
   _noodle_avatar_wait "$pid"
   wait "$pid"
   local helper_status=$?
+  pid=""
   if _noodle_debug_enabled && [[ -s "$tmp.stderr" ]]; then
     cat "$tmp.stderr" >&2
   fi
@@ -330,7 +368,7 @@ function _noodle_call_helper() {
 
 function _noodle_stream_helper() {
   emulate -L zsh
-  setopt local_options pipefail no_aliases no_bg_nice no_monitor
+  setopt local_options pipefail no_aliases no_bg_nice no_monitor localtraps
   _noodle_ensure_daemon || return 1
   local mode="$1"
   local input="$2"
@@ -347,6 +385,21 @@ function _noodle_stream_helper() {
     rm -f "$stderr_file"
     return 1
   }
+
+  trap '
+    if [[ -n "$spinner_pid" ]]; then
+      _noodle_avatar_stop_spinner "$spinner_pid"
+      spinner_pid=""
+    fi
+    if [[ -n "$helper_pid" ]]; then
+      kill "$helper_pid" 2>/dev/null || true
+      wait "$helper_pid" 2>/dev/null || true
+      helper_pid=""
+    fi
+    rm -f "$fifo" "$stderr_file"
+    _noodle_restore_terminal_state
+    return 130
+  ' INT TERM
 
   "$NOODLE_HELPER" \
     --stream \
@@ -377,7 +430,9 @@ function _noodle_stream_helper() {
 
   wait "$helper_pid"
   helper_status=$?
+  helper_pid=""
   [[ -n "$spinner_pid" ]] && _noodle_avatar_stop_spinner "$spinner_pid"
+  spinner_pid=""
 
   if _noodle_debug_enabled && [[ -s "$stderr_file" ]]; then
     cat "$stderr_file" >&2
@@ -515,6 +570,7 @@ function _noodle_handle_payload() {
       if [[ -n "$text" ]]; then
         if [[ "$text" == *$'\e['* ]]; then
           printf '%s\033[0m' "$text" >&2
+          NOODLE_TERMINAL_NEEDS_RESET=1
           if [[ "$text" == *$'\n' ]]; then
             NOODLE_RAW_SESSION_OUTPUT_ACTIVE=0
           else
@@ -681,6 +737,11 @@ alias oo='noglob _noodle_chat_oo'
 unalias , 2>/dev/null || true
 alias ,='noglob _noodle_chat_prefix'
 
+function _noodle_zshexit_restore() {
+  emulate -L zsh
+  _noodle_restore_terminal_state
+}
+
 function _noodle_accept_line_widget() {
   emulate -L zsh
   local raw_input="$BUFFER"
@@ -694,6 +755,8 @@ function _noodle_accept_line_widget() {
 }
 
 if [[ -o interactive ]] && whence zle >/dev/null 2>&1; then
+  autoload -Uz add-zsh-hook
+  add-zsh-hook zshexit _noodle_zshexit_restore 2>/dev/null || true
   zle -N _noodle_accept_line_widget
   bindkey '^M' _noodle_accept_line_widget
   bindkey '^J' _noodle_accept_line_widget
@@ -750,6 +813,7 @@ function preexec() {
 
 function precmd() {
   NOODLE_LAST_STATUS="$?"
+  _noodle_restore_terminal_state
   if [[ -n "$NOODLE_PENDING_SLASH_COMMAND" ]]; then
     local raw_input="$NOODLE_PENDING_SLASH_COMMAND"
     NOODLE_PENDING_SLASH_COMMAND=""
@@ -771,4 +835,16 @@ function TRAPZERR() {
       ;;
   esac
   return "$exit_code"
+}
+
+function TRAPINT() {
+  emulate -L zsh
+  _noodle_restore_terminal_state
+  return 130
+}
+
+function TRAPTERM() {
+  emulate -L zsh
+  _noodle_restore_terminal_state
+  return 143
 }

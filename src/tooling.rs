@@ -9,9 +9,17 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    mpsc::{self, Receiver, RecvTimeoutError},
+};
+use std::thread;
 use std::time::Duration;
+
+const SUPPORTED_MODULE_API_VERSION: &str = "v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolTier {
@@ -101,6 +109,36 @@ pub struct ToolCallResult {
     pub tool: String,
     pub ok: bool,
     pub output: Value,
+}
+
+#[derive(Debug, Clone)]
+struct McpServerConfig {
+    name: String,
+    command: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: HashMap<String, String>,
+    message_format: McpMessageFormat,
+    startup_timeout: Duration,
+    request_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpMessageFormat {
+    ContentLength,
+    Ndjson,
+}
+
+#[derive(Debug)]
+struct McpClientSession {
+    server_name: String,
+    child: Child,
+    stdin: ChildStdin,
+    messages: Receiver<Result<Value, String>>,
+    stderr_tail: Arc<Mutex<String>>,
+    message_format: McpMessageFormat,
+    next_id: u64,
+    startup_timeout: Duration,
+    request_timeout: Duration,
 }
 
 fn tool_definition(
@@ -359,8 +397,52 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         tool_definition(
+            "mcp_tools_list",
+            "List tools exposed by a configured MCP server.",
+            ToolTier::Tier3,
+            ToolPermissionClass::External,
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "required": ["server"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_definition(
+            "mcp_tool_call",
+            "Call a tool on a configured MCP server.",
+            ToolTier::Tier3,
+            ToolPermissionClass::External,
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "arguments": { "type": "object" }
+                },
+                "required": ["server", "tool"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_definition(
+            "mcp_resources_list",
+            "List resources exposed by a configured MCP server.",
+            ToolTier::Tier3,
+            ToolPermissionClass::External,
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "required": ["server"],
+                "additionalProperties": false
+            }),
+        ),
+        tool_definition(
             "mcp_resource_read",
-            "Read an MCP resource from a configured server. Reserved primitive.",
+            "Read an MCP resource from a configured server.",
             ToolTier::Tier3,
             ToolPermissionClass::External,
             json!({
@@ -419,6 +501,7 @@ pub fn plugin_manifest(_plugin_id: &str) -> PluginManifest {
 
 #[derive(Debug, Deserialize)]
 struct ExternalPluginManifestFile {
+    api_version: String,
     id: String,
     #[serde(default)]
     handles_events: Vec<String>,
@@ -506,6 +589,9 @@ fn external_plugin_manifests(config: &Value) -> Vec<PluginManifest> {
             let Ok(file) = serde_json::from_str::<ExternalPluginManifestFile>(&body) else {
                 continue;
             };
+            if file.api_version != SUPPORTED_MODULE_API_VERSION {
+                continue;
+            }
             if file.id.trim().is_empty() || file.command.is_empty() {
                 continue;
             }
@@ -788,7 +874,10 @@ pub fn invoke_builtin_tool(
         "interactive_shell_write" => interactive_shell_write(&normalized_args)?,
         "interactive_shell_key" => interactive_shell_key(&normalized_args)?,
         "interactive_shell_close" => interactive_shell_close(&normalized_args)?,
-        "mcp_resource_read" => tool_mcp_resource_read(&normalized_args)?,
+        "mcp_tools_list" => tool_mcp_tools_list(config, &normalized_args)?,
+        "mcp_tool_call" => tool_mcp_tool_call(config, &normalized_args)?,
+        "mcp_resources_list" => tool_mcp_resources_list(config, &normalized_args)?,
+        "mcp_resource_read" => tool_mcp_resource_read(config, &normalized_args)?,
         "task_note_write" => tool_task_note_write(config, &normalized_args)?,
         "agent_handoff_create" => tool_agent_handoff_create(config, &normalized_args)?,
         other => return Err(format!("unknown builtin tool: {other}")),
@@ -1292,7 +1381,292 @@ fn path_matches_query(path: &Path, query: &str) -> bool {
             .all(|token| name.contains(token) || display.contains(token))
 }
 
-fn tool_mcp_resource_read(args: &Value) -> Result<Value, String> {
+fn tool_mcp_tools_list(config: &Value, args: &Value) -> Result<Value, String> {
+    let server = args
+        .get("server")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "mcp_tools_list requires server".to_string())?;
+    if let Some(tools) = lookup_mcp_stub_list(args, "mcp_tools_list", server) {
+        return Ok(json!({
+            "server": server,
+            "tools": tools,
+        }));
+    }
+    let result = with_mcp_session(config, server, |session| {
+        session.send_request("tools/list", json!({}))
+    })?;
+    Ok(json!({
+        "server": server,
+        "tools": result
+            .get("tools")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    }))
+}
+
+fn tool_mcp_tool_call(config: &Value, args: &Value) -> Result<Value, String> {
+    let server = args
+        .get("server")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "mcp_tool_call requires server".to_string())?;
+    let tool = args
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "mcp_tool_call requires tool".to_string())?;
+    let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    if let Some(result) = lookup_mcp_stub_call(args, server, tool) {
+        return Ok(json!({
+            "server": server,
+            "requested_tool": tool,
+            "tool": tool,
+            "requested_arguments": arguments.clone(),
+            "arguments": arguments,
+            "result": result.clone(),
+            "content": result.get("content").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+            "content_text": flatten_mcp_text_content(result.get("content").unwrap_or(&Value::Null)),
+            "is_error": result.get("isError").and_then(Value::as_bool).unwrap_or(false),
+        }));
+    }
+    let (resolved_tool, prepared_arguments, result) =
+        with_mcp_session(config, server, |session| {
+            let available_tools = session
+                .send_request("tools/list", json!({}))?
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let resolved_tool =
+                resolve_mcp_tool_name(tool, &available_tools).unwrap_or_else(|| tool.to_string());
+            let prepared_arguments = available_tools
+                .iter()
+                .find(|item| {
+                    item.get("name").and_then(Value::as_str) == Some(resolved_tool.as_str())
+                })
+                .and_then(|item| item.get("inputSchema"))
+                .map(|schema| coerce_mcp_arguments_to_schema(&arguments, schema))
+                .unwrap_or_else(|| arguments.clone());
+            let result = session.send_request(
+                "tools/call",
+                json!({
+                    "name": resolved_tool,
+                    "arguments": prepared_arguments,
+                }),
+            )?;
+            Ok((resolved_tool, prepared_arguments, result))
+        })?;
+    Ok(json!({
+        "server": server,
+        "requested_tool": tool,
+        "tool": resolved_tool,
+        "requested_arguments": args.get("arguments").cloned().unwrap_or_else(|| json!({})),
+        "arguments": prepared_arguments,
+        "result": result.clone(),
+        "content": result.get("content").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "content_text": flatten_mcp_text_content(result.get("content").unwrap_or(&Value::Null)),
+        "is_error": result.get("isError").and_then(Value::as_bool).unwrap_or(false),
+    }))
+}
+
+fn resolve_mcp_tool_name(requested: &str, available_tools: &[Value]) -> Option<String> {
+    if available_tools
+        .iter()
+        .any(|item| item.get("name").and_then(Value::as_str) == Some(requested))
+    {
+        return Some(requested.to_string());
+    }
+    let requested_tokens = tokenize_search_text(requested);
+    let requested_norm = normalize_search_text(requested);
+    if requested_tokens.is_empty() && requested_norm.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(i32, String)> = None;
+    let mut second_best = i32::MIN;
+    for tool in available_tools {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let score = mcp_tool_match_score(&requested_tokens, &requested_norm, tool);
+        if score > best.as_ref().map(|(value, _)| *value).unwrap_or(i32::MIN) {
+            second_best = best.as_ref().map(|(value, _)| *value).unwrap_or(i32::MIN);
+            best = Some((score, name.to_string()));
+        } else if score > second_best {
+            second_best = score;
+        }
+    }
+
+    let (best_score, best_name) = best?;
+    if best_score < 20 {
+        return None;
+    }
+    if second_best != i32::MIN && best_score - second_best < 15 {
+        return None;
+    }
+    Some(best_name)
+}
+
+fn mcp_tool_match_score(
+    requested_tokens: &HashSet<String>,
+    requested_norm: &str,
+    tool: &Value,
+) -> i32 {
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut searchable = format!("{name} {description}");
+    if let Some(properties) = tool
+        .get("inputSchema")
+        .and_then(|schema| schema.get("properties"))
+        .and_then(Value::as_object)
+    {
+        for key in properties.keys() {
+            searchable.push(' ');
+            searchable.push_str(key);
+        }
+    }
+    let name_tokens = tokenize_search_text(name);
+    let searchable_tokens = tokenize_search_text(&searchable);
+    let name_overlap = requested_tokens.intersection(&name_tokens).count() as i32;
+    let searchable_overlap = requested_tokens.intersection(&searchable_tokens).count() as i32;
+    let name_norm = normalize_search_text(name);
+
+    let mut score = name_overlap * 35 + searchable_overlap * 20;
+    if !requested_norm.is_empty() && !name_norm.is_empty() {
+        if requested_norm == name_norm {
+            score += 1_000;
+        } else if requested_norm.contains(&name_norm) || name_norm.contains(requested_norm) {
+            score += 25;
+        }
+    }
+    score
+}
+
+fn tokenize_search_text(text: &str) -> HashSet<String> {
+    text.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .filter(|token| token.len() > 1)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_search_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn coerce_mcp_arguments_to_schema(value: &Value, schema: &Value) -> Value {
+    if let Some(kind) = schema.get("type").and_then(Value::as_str) {
+        return match kind {
+            "object" => coerce_object_arguments_to_schema(value, schema),
+            "array" => coerce_array_argument_to_schema(value, schema),
+            "integer" => coerce_scalar_argument(value, "integer").unwrap_or_else(|| value.clone()),
+            "number" => coerce_scalar_argument(value, "number").unwrap_or_else(|| value.clone()),
+            "boolean" => coerce_scalar_argument(value, "boolean").unwrap_or_else(|| value.clone()),
+            "string" => coerce_scalar_argument(value, "string").unwrap_or_else(|| value.clone()),
+            _ => value.clone(),
+        };
+    }
+    for key in ["oneOf", "anyOf"] {
+        if let Some(options) = schema.get(key).and_then(Value::as_array) {
+            for option in options {
+                let coerced = coerce_mcp_arguments_to_schema(value, option);
+                if coerced != *value {
+                    return coerced;
+                }
+            }
+        }
+    }
+    value.clone()
+}
+
+fn coerce_object_arguments_to_schema(value: &Value, schema: &Value) -> Value {
+    let Some(input) = value.as_object() else {
+        return value.clone();
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return value.clone();
+    };
+    let mut result = input.clone();
+    for (key, property_schema) in properties {
+        if let Some(current) = result.get(key).cloned() {
+            let coerced = coerce_mcp_arguments_to_schema(&current, property_schema);
+            if coerced != current {
+                result.insert(key.clone(), coerced);
+            }
+        }
+    }
+    Value::Object(result)
+}
+
+fn coerce_array_argument_to_schema(value: &Value, schema: &Value) -> Value {
+    if let Some(items) = value.as_array() {
+        let item_schema = schema.get("items").unwrap_or(&Value::Null);
+        return Value::Array(
+            items
+                .iter()
+                .map(|item| coerce_mcp_arguments_to_schema(item, item_schema))
+                .collect(),
+        );
+    }
+    if value.is_null() {
+        return value.clone();
+    }
+    let item_schema = schema.get("items").unwrap_or(&Value::Null);
+    Value::Array(vec![coerce_mcp_arguments_to_schema(value, item_schema)])
+}
+
+fn coerce_scalar_argument(value: &Value, kind: &str) -> Option<Value> {
+    match (kind, value) {
+        ("integer", Value::String(text)) => text.parse::<i64>().ok().map(|n| json!(n)),
+        ("number", Value::String(text)) => text.parse::<f64>().ok().map(|n| json!(n)),
+        ("boolean", Value::String(text)) if text.eq_ignore_ascii_case("true") || text == "1" => {
+            Some(Value::Bool(true))
+        }
+        ("boolean", Value::String(text)) if text.eq_ignore_ascii_case("false") || text == "0" => {
+            Some(Value::Bool(false))
+        }
+        ("string", Value::Number(number)) => Some(Value::String(number.to_string())),
+        ("string", Value::Bool(boolean)) => Some(Value::String(boolean.to_string())),
+        _ => None,
+    }
+}
+
+fn tool_mcp_resources_list(config: &Value, args: &Value) -> Result<Value, String> {
+    let server = args
+        .get("server")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "mcp_resources_list requires server".to_string())?;
+    if let Some(resources) = lookup_mcp_stub_list(args, "mcp_resources_list", server) {
+        return Ok(json!({
+            "server": server,
+            "resources": resources,
+        }));
+    }
+    let result = with_mcp_session(config, server, |session| {
+        session.send_request("resources/list", json!({}))
+    })?;
+    Ok(json!({
+        "server": server,
+        "resources": result
+            .get("resources")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    }))
+}
+
+fn tool_mcp_resource_read(config: &Value, args: &Value) -> Result<Value, String> {
     let server = args
         .get("server")
         .and_then(Value::as_str)
@@ -1301,18 +1675,564 @@ fn tool_mcp_resource_read(args: &Value) -> Result<Value, String> {
         .get("uri")
         .and_then(Value::as_str)
         .ok_or_else(|| "mcp_resource_read requires uri".to_string())?;
-    if let Some(value) = args
-        .get("_stub")
-        .and_then(|stub| stub.get("mcp_resource_read"))
-        .and_then(|entries| entries.get(format!("{server}|{uri}")))
-    {
+    if let Some(value) = lookup_mcp_stub_resource(args, server, uri) {
+        let contents = value
+            .get("contents")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let content = value
+            .get("content")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| flatten_mcp_text_content(&contents));
         return Ok(json!({
             "server": server,
             "uri": uri,
-            "content": value.clone(),
+            "contents": contents,
+            "content": content,
         }));
     }
-    Err("mcp_resource_read is not yet connected to external MCP servers".into())
+    let result = with_mcp_session(config, server, |session| {
+        session.send_request("resources/read", json!({ "uri": uri }))
+    })?;
+    let contents = result
+        .get("contents")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    Ok(json!({
+        "server": server,
+        "uri": uri,
+        "contents": contents.clone(),
+        "content": flatten_mcp_text_content(&contents),
+    }))
+}
+
+fn mcp_session_cache() -> &'static Mutex<HashMap<String, McpClientSession>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, McpClientSession>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn shutdown_all_mcp_sessions() -> Result<(), String> {
+    let mut cache = mcp_session_cache().lock().map_err(|err| err.to_string())?;
+    let mut errors = Vec::new();
+    for (_, mut session) in cache.drain() {
+        if let Err(err) = session.shutdown() {
+            errors.push(err);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn with_mcp_session<T>(
+    config: &Value,
+    server: &str,
+    callback: impl FnOnce(&mut McpClientSession) -> Result<T, String>,
+) -> Result<T, String> {
+    let server_config = mcp_server_config(config, server)?;
+    let mut cache = mcp_session_cache().lock().map_err(|err| err.to_string())?;
+    let should_connect = match cache.get_mut(server) {
+        Some(session) => session.is_exited()?,
+        None => true,
+    };
+    if should_connect {
+        cache.insert(
+            server.to_string(),
+            McpClientSession::connect(&server_config)?,
+        );
+    }
+    let result = {
+        let session = cache
+            .get_mut(server)
+            .ok_or_else(|| format!("failed to connect to MCP server: {server}"))?;
+        callback(session)
+    };
+    if result.is_err() {
+        if let Some(mut session) = cache.remove(server) {
+            let _ = session.shutdown();
+        }
+    }
+    result
+}
+
+impl McpClientSession {
+    fn connect(config: &McpServerConfig) -> Result<Self, String> {
+        let program = config
+            .command
+            .first()
+            .ok_or_else(|| format!("MCP server {} is missing a command", config.name))?;
+        let mut command = ProcessCommand::new(program);
+        if config.command.len() > 1 {
+            command.args(&config.command[1..]);
+        }
+        if let Some(cwd) = &config.cwd {
+            command.current_dir(cwd);
+        }
+        for (key, value) in &config.env {
+            command.env(key, value);
+        }
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command.spawn().map_err(|err| {
+            format!(
+                "failed to start MCP server {} with {:?}: {}",
+                config.name, config.command, err
+            )
+        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("MCP server {} did not expose stdin", config.name))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("MCP server {} did not expose stdout", config.name))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| format!("MCP server {} did not expose stderr", config.name))?;
+        let stderr_tail = Arc::new(Mutex::new(String::new()));
+        let messages = spawn_mcp_stdout_reader(
+            stdout,
+            config.name.clone(),
+            config.command.clone(),
+            config.message_format,
+        );
+        spawn_mcp_stderr_reader(stderr, stderr_tail.clone());
+        let mut session = Self {
+            server_name: config.name.clone(),
+            child,
+            stdin,
+            messages,
+            stderr_tail,
+            message_format: config.message_format,
+            next_id: 1,
+            startup_timeout: config.startup_timeout,
+            request_timeout: config.request_timeout,
+        };
+        if let Err(err) = session.initialize(&config.name) {
+            let _ = session.shutdown();
+            return Err(err);
+        }
+        Ok(session)
+    }
+
+    fn is_exited(&mut self) -> Result<bool, String> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(|err| err.to_string())
+    }
+
+    fn initialize(&mut self, server: &str) -> Result<(), String> {
+        self.request_with_timeout(
+            server,
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "noodle",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            }),
+            self.startup_timeout,
+        )?;
+        self.send_notification("notifications/initialized", json!({}))?;
+        Ok(())
+    }
+
+    fn send_request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let server_name = self.server_name.clone();
+        self.request_with_timeout(&server_name, method, params, self.request_timeout)
+    }
+
+    fn request_with_timeout(
+        &mut self,
+        server: &str,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let request_id = self.next_id;
+        self.next_id += 1;
+        self.send_message(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }))?;
+        self.read_response(server, request_id, method, timeout)
+    }
+
+    fn send_notification(&mut self, method: &str, params: Value) -> Result<(), String> {
+        self.send_message(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }))
+    }
+
+    fn send_message(&mut self, message: &Value) -> Result<(), String> {
+        let body = serde_json::to_string(message).map_err(|err| err.to_string())?;
+        match self.message_format {
+            McpMessageFormat::ContentLength => {
+                write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())
+                    .map_err(|err| err.to_string())?;
+                self.stdin
+                    .write_all(body.as_bytes())
+                    .map_err(|err| err.to_string())?;
+            }
+            McpMessageFormat::Ndjson => {
+                self.stdin
+                    .write_all(body.as_bytes())
+                    .and_then(|_| self.stdin.write_all(b"\n"))
+                    .map_err(|err| err.to_string())?;
+            }
+        }
+        self.stdin.flush().map_err(|err| err.to_string())
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        let _ = self.stdin.flush();
+        let _ = self.child.kill();
+        self.child.wait().map(|_| ()).map_err(|err| err.to_string())
+    }
+
+    fn read_response(
+        &mut self,
+        server: &str,
+        request_id: u64,
+        method: &str,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        loop {
+            match self.messages.recv_timeout(timeout) {
+                Ok(Ok(message)) => {
+                    if message.get("id").and_then(Value::as_u64) != Some(request_id) {
+                        continue;
+                    }
+                    if let Some(error) = message.get("error") {
+                        return Err(format_mcp_error(server, method, error, &self.stderr_tail));
+                    }
+                    return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+                }
+                Ok(Err(err)) => {
+                    return Err(decorate_mcp_transport_error(
+                        server,
+                        method,
+                        &err,
+                        &self.stderr_tail,
+                    ));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(decorate_mcp_transport_error(
+                        server,
+                        method,
+                        "timed out waiting for MCP response",
+                        &self.stderr_tail,
+                    ));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(decorate_mcp_transport_error(
+                        server,
+                        method,
+                        "MCP server disconnected",
+                        &self.stderr_tail,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn spawn_mcp_stdout_reader(
+    stdout: ChildStdout,
+    server: String,
+    command: Vec<String>,
+    message_format: McpMessageFormat,
+) -> Receiver<Result<Value, String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let message = read_mcp_message(&mut reader, message_format)
+                .map_err(|err| format!("MCP server {server} ({command:?}) stream error: {err}"));
+            let stop = message.is_err();
+            if sender.send(message).is_err() || stop {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
+fn spawn_mcp_stderr_reader(stderr: impl Read + Send + 'static, tail: Arc<Mutex<String>>) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => append_stderr_tail(&tail, &line),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn read_mcp_message<R: BufRead>(
+    reader: &mut R,
+    message_format: McpMessageFormat,
+) -> Result<Value, String> {
+    match message_format {
+        McpMessageFormat::ContentLength => read_mcp_content_length_message(reader),
+        McpMessageFormat::Ndjson => read_mcp_ndjson_message(reader),
+    }
+}
+
+fn read_mcp_content_length_message<R: BufRead>(reader: &mut R) -> Result<Value, String> {
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        if bytes == 0 {
+            return Err("server closed stdout".into());
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
+            let parsed = rest
+                .trim()
+                .parse::<usize>()
+                .map_err(|err| err.to_string())?;
+            content_length = Some(parsed);
+        }
+    }
+    let length = content_length.ok_or_else(|| "missing Content-Length header".to_string())?;
+    let mut body = vec![0; length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|err| err.to_string())?;
+    serde_json::from_slice::<Value>(&body).map_err(|err| err.to_string())
+}
+
+fn read_mcp_ndjson_message<R: BufRead>(reader: &mut R) -> Result<Value, String> {
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).map_err(|err| err.to_string())?;
+        if bytes == 0 {
+            return Err("server closed stdout".into());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        return serde_json::from_str::<Value>(trimmed).map_err(|err| err.to_string());
+    }
+}
+
+fn append_stderr_tail(tail: &Arc<Mutex<String>>, chunk: &str) {
+    if let Ok(mut value) = tail.lock() {
+        value.push_str(chunk);
+        if value.len() > 4096 {
+            let keep_from = value.len().saturating_sub(4096);
+            *value = value[keep_from..].to_string();
+        }
+    }
+}
+
+fn format_mcp_error(
+    server: &str,
+    method: &str,
+    error: &Value,
+    stderr_tail: &Arc<Mutex<String>>,
+) -> String {
+    let code = error
+        .get("code")
+        .and_then(Value::as_i64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "?".into());
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown MCP error");
+    decorate_mcp_transport_error(
+        server,
+        method,
+        &format!("error {code}: {message}"),
+        stderr_tail,
+    )
+}
+
+fn decorate_mcp_transport_error(
+    server: &str,
+    method: &str,
+    message: &str,
+    stderr_tail: &Arc<Mutex<String>>,
+) -> String {
+    let stderr = stderr_tail
+        .lock()
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match stderr {
+        Some(stderr) => format!("MCP {server} {method} failed: {message}. stderr: {stderr}"),
+        None => format!("MCP {server} {method} failed: {message}"),
+    }
+}
+
+fn mcp_server_config(config: &Value, server: &str) -> Result<McpServerConfig, String> {
+    let Some(raw) = lookup(config, &format!("mcp.servers.{server}")) else {
+        return Err(format!("MCP server is not configured: {server}"));
+    };
+    let transport = raw
+        .get("transport")
+        .and_then(Value::as_str)
+        .unwrap_or("stdio");
+    if transport != "stdio" {
+        return Err(format!(
+            "unsupported MCP transport for {server}: {transport} (only stdio is supported)"
+        ));
+    }
+    let command = raw
+        .get("command")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| expand_home(value).to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if command.is_empty() {
+        return Err(format!(
+            "MCP server {server} requires a non-empty command array"
+        ));
+    }
+    let cwd = raw
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(expand_home);
+    let env = raw
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), json_scalar_to_string(value)))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let message_format = match raw
+        .get("message_format")
+        .and_then(Value::as_str)
+        .unwrap_or("content_length")
+    {
+        "content_length" => McpMessageFormat::ContentLength,
+        "ndjson" | "newline" => McpMessageFormat::Ndjson,
+        other => {
+            return Err(format!(
+                "unsupported MCP message_format for {server}: {other} (expected content_length or ndjson)"
+            ));
+        }
+    };
+    let startup_timeout_ms = raw
+        .get("startup_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(15_000)
+        .clamp(1_000, 120_000);
+    let request_timeout_ms = raw
+        .get("request_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000)
+        .clamp(1_000, 300_000);
+    Ok(McpServerConfig {
+        name: server.to_string(),
+        command,
+        cwd,
+        env,
+        message_format,
+        startup_timeout: Duration::from_millis(startup_timeout_ms),
+        request_timeout: Duration::from_millis(request_timeout_ms),
+    })
+}
+
+fn json_scalar_to_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(true) => "1".into(),
+        Value::Bool(false) => "0".into(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn lookup_mcp_stub_list(args: &Value, key: &str, server: &str) -> Option<Value> {
+    args.get("_stub")
+        .and_then(|stub| stub.get(key))
+        .and_then(|entries| entries.get(server))
+        .cloned()
+}
+
+fn lookup_mcp_stub_call(args: &Value, server: &str, tool: &str) -> Option<Value> {
+    args.get("_stub")
+        .and_then(|stub| stub.get("mcp_tool_call"))
+        .and_then(|entries| entries.get(format!("{server}|{tool}")))
+        .cloned()
+}
+
+fn lookup_mcp_stub_resource(args: &Value, server: &str, uri: &str) -> Option<Value> {
+    let value = args
+        .get("_stub")
+        .and_then(|stub| stub.get("mcp_resource_read"))
+        .and_then(|entries| entries.get(format!("{server}|{uri}")))?;
+    if value.is_object() {
+        Some(value.clone())
+    } else {
+        Some(json!({
+            "content": value.clone(),
+            "contents": [
+                {
+                    "uri": uri,
+                    "text": value.clone(),
+                }
+            ]
+        }))
+    }
+}
+
+fn flatten_mcp_text_content(value: &Value) -> String {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            item.get("blob")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
 }
 
 fn tool_task_note_write(config: &Value, args: &Value) -> Result<Value, String> {
@@ -1488,8 +2408,8 @@ fn expand_home(path: &str) -> PathBuf {
 mod tests {
     use super::{
         enabled_plugin_manifests, exported_mcp_tools, plugin_matches_request,
-        registered_slash_command_names, slash_command_name, tool_glob, tool_path_search,
-        tools_for_plugin, wildcard_match,
+        registered_slash_command_names, shutdown_all_mcp_sessions, slash_command_name, tool_glob,
+        tool_mcp_tool_call, tool_path_search, tools_for_plugin, wildcard_match,
     };
     use serde_json::json;
     use std::fs;
@@ -1508,6 +2428,215 @@ mod tests {
         path
     }
 
+    fn write_mock_mcp_server(root: &PathBuf) -> PathBuf {
+        let path = root.join("mock_mcp_server.py");
+        fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+counter = 0
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("utf-8").split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    if not body:
+        return None
+    return json.loads(body.decode("utf-8"))
+
+def send(message):
+    body = json.dumps(message).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    request = read_message()
+    if request is None:
+        break
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "mock-docs", "version": "1.0.0"}
+            }
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/call":
+        if params.get("name") == "counter":
+            counter += 1
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": f"counter:{counter}"}],
+                    "isError": False
+                }
+            })
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "content": [{"type": "text", "text": "unknown"}],
+                    "isError": True
+                }
+            })
+    else:
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {}
+        })
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
+    fn write_mock_resolution_mcp_server(root: &PathBuf) -> PathBuf {
+        let path = root.join("mock_resolution_mcp_server.py");
+        fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+def read_message():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, value = line.decode("utf-8").split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    body = sys.stdin.buffer.read(length)
+    if not body:
+        return None
+    return json.loads(body.decode("utf-8"))
+
+def send(message):
+    body = json.dumps(message).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    request = read_message()
+    if request is None:
+        break
+    method = request.get("method")
+    request_id = request.get("id")
+    params = request.get("params") or {}
+
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "mock-resolution", "version": "1.0.0"}
+            }
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "new_page",
+                        "description": "Open a new page and load a URL.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"}
+                            },
+                            "required": ["url"]
+                        }
+                    },
+                    {
+                        "name": "wait_for",
+                        "description": "Wait for text to appear on the page.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "text": {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                }
+                            },
+                            "required": ["text"]
+                        }
+                    }
+                ]
+            }
+        })
+    elif method == "tools/call":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps({
+                            "name": params.get("name"),
+                            "arguments": params.get("arguments")
+                        }, sort_keys=True)
+                    }
+                ],
+                "isError": False
+            }
+        })
+    else:
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {}
+        })
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).unwrap();
+        }
+        path
+    }
+
     #[test]
     fn enabled_plugin_manifests_follow_config_order() {
         let config = json!({
@@ -1521,6 +2650,166 @@ mod tests {
             .map(|manifest| manifest.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["typos", "chat"]);
+    }
+
+    #[test]
+    fn external_manifests_require_supported_api_version() {
+        let root = temp_dir("noodle-module-api-version");
+        let hello = root.join("hello");
+        let old = root.join("old");
+        fs::create_dir_all(&hello).unwrap();
+        fs::create_dir_all(&old).unwrap();
+        fs::write(
+            hello.join("manifest.json"),
+            r#"{
+  "api_version": "v1",
+  "id": "hello",
+  "handles_events": ["slash_command"],
+  "slash_commands": [],
+  "uses_tools": [],
+  "exports_tools": [],
+  "command": ["python3", "${MODULE_DIR}/module.py"]
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            old.join("manifest.json"),
+            r#"{
+  "api_version": "v0",
+  "id": "old",
+  "handles_events": ["slash_command"],
+  "slash_commands": [],
+  "uses_tools": [],
+  "exports_tools": [],
+  "command": ["python3", "${MODULE_DIR}/module.py"]
+}"#,
+        )
+        .unwrap();
+        let config = json!({
+            "modules": {
+                "paths": [root.display().to_string()],
+                "order": ["hello", "old"]
+            }
+        });
+        let manifests = enabled_plugin_manifests(&config);
+        let ids = manifests
+            .iter()
+            .map(|manifest| manifest.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["hello"]);
+    }
+
+    #[test]
+    fn shutdown_all_mcp_sessions_restarts_stateful_servers() {
+        shutdown_all_mcp_sessions().unwrap();
+        let root = temp_dir("noodle-mcp-shutdown");
+        let server = write_mock_mcp_server(&root);
+        let config = json!({
+            "mcp": {
+                "servers": {
+                    "docs_counter": {
+                        "command": ["python3", server.display().to_string()],
+                        "startup_timeout_ms": 5000,
+                        "request_timeout_ms": 5000
+                    }
+                }
+            }
+        });
+
+        let first = tool_mcp_tool_call(
+            &config,
+            &json!({
+                "server": "docs_counter",
+                "tool": "counter",
+                "arguments": {}
+            }),
+        )
+        .unwrap();
+        assert_eq!(first["content_text"].as_str(), Some("counter:1"));
+
+        let second = tool_mcp_tool_call(
+            &config,
+            &json!({
+                "server": "docs_counter",
+                "tool": "counter",
+                "arguments": {}
+            }),
+        )
+        .unwrap();
+        assert_eq!(second["content_text"].as_str(), Some("counter:2"));
+
+        shutdown_all_mcp_sessions().unwrap();
+
+        let third = tool_mcp_tool_call(
+            &config,
+            &json!({
+                "server": "docs_counter",
+                "tool": "counter",
+                "arguments": {}
+            }),
+        )
+        .unwrap();
+        assert_eq!(third["content_text"].as_str(), Some("counter:1"));
+
+        shutdown_all_mcp_sessions().unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mcp_tool_calls_resolve_generic_name_matches_and_coerce_arguments() {
+        shutdown_all_mcp_sessions().unwrap();
+        let root = temp_dir("noodle-mcp-resolution");
+        let server = write_mock_resolution_mcp_server(&root);
+        let config = json!({
+            "mcp": {
+                "servers": {
+                    "docs_resolution": {
+                        "command": ["python3", server.display().to_string()],
+                        "startup_timeout_ms": 5000,
+                        "request_timeout_ms": 5000
+                    }
+                }
+            }
+        });
+
+        let open = tool_mcp_tool_call(
+            &config,
+            &json!({
+                "server": "docs_resolution",
+                "tool": "open_url",
+                "arguments": {
+                    "url": "https://example.com"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(open["requested_tool"].as_str(), Some("open_url"));
+        assert_eq!(open["tool"].as_str(), Some("new_page"));
+        assert_eq!(
+            open["content_text"].as_str(),
+            Some("{\"arguments\": {\"url\": \"https://example.com\"}, \"name\": \"new_page\"}")
+        );
+
+        let wait = tool_mcp_tool_call(
+            &config,
+            &json!({
+                "server": "docs_resolution",
+                "tool": "wait_for",
+                "arguments": {
+                    "text": "ready"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(wait["tool"].as_str(), Some("wait_for"));
+        assert_eq!(wait["arguments"]["text"], json!(["ready"]));
+        assert_eq!(
+            wait["content_text"].as_str(),
+            Some("{\"arguments\": {\"text\": [\"ready\"]}, \"name\": \"wait_for\"}")
+        );
+
+        shutdown_all_mcp_sessions().unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

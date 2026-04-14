@@ -271,6 +271,14 @@ def host_binary(request):
     )
 
 
+def module_api_prefix(request):
+    module_api = ((request.get("host") or {}).get("module_api")) or {}
+    prefix = module_api.get("command_prefix")
+    if isinstance(prefix, list) and prefix:
+        return prefix
+    return [host_binary(request), "module-api"]
+
+
 def resolved_config_path(request):
     return expand_home(
         request.get("config_path")
@@ -280,7 +288,11 @@ def resolved_config_path(request):
 
 
 def model_output(request, prompt):
-    command = [host_binary(request), "model-output", "--config", resolved_config_path(request)]
+    command = module_api_prefix(request) + [
+        "model-output",
+        "--config",
+        resolved_config_path(request),
+    ]
     if request.get("debug"):
         command.append("--debug")
     env = os.environ.copy()

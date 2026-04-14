@@ -238,6 +238,13 @@ Rules:\n\
 - For requests to locate named files, folders, worktrees, branches, or personal artifacts, do not assume the current workspace is the only relevant scope.\n\
 - If the target may live outside the current workspace, search the broader local roots shown in context before concluding it is missing.\n\
 - Prefer web tools only when the task needs outside or current information.\n\
+- For MCP servers, never invent nested tool names.\n\
+- If you need to call an MCP tool on a server and you do not already have a recent mcp_tools_list result for that same server in Tool Results, call mcp_tools_list first.\n\
+- When you use mcp_tool_call, copy the nested MCP tool name exactly from the latest mcp_tools_list result for that server.\n\
+- If an MCP tool call says the nested tool was not found, inspect the latest mcp_tools_list result and retry with one of those exact names.\n\
+- Do not keep guessing short aliases like open, snapshot, or extract when the server exposes different exact names.\n\
+- Match nested MCP arguments to the latest mcp_tools_list signature for that server.\n\
+- Do not immediately repeat an identical tool call with identical arguments after it succeeded. Use the prior result or choose a different next step.\n\
 - After tool results are provided, continue toward a final answer.\n\
 - Use PLAN when the task clearly needs multiple steps.\n\
 - If no tool is needed, respond with FINAL immediately.\n\
@@ -264,15 +271,18 @@ fn render_tool_turns(turns: &[ToolTurnContext]) -> String {
 }
 
 fn render_tool_turn(turn: &ToolTurnContext) -> String {
-    if turn.tool == "interactive_shell_read" {
-        return render_interactive_shell_read_turn(turn);
+    match turn.tool.as_str() {
+        "interactive_shell_read" => render_interactive_shell_read_turn(turn),
+        "mcp_tools_list" => render_mcp_tools_list_turn(turn),
+        "mcp_resources_list" => render_mcp_resources_list_turn(turn),
+        "mcp_tool_call" => render_mcp_tool_call_turn(turn),
+        _ => format!(
+            "TOOL_RESULT: {} {} => {}",
+            turn.tool,
+            compact_json(&turn.args),
+            compact_json(&turn.result)
+        ),
     }
-    format!(
-        "TOOL_RESULT: {} {} => {}",
-        turn.tool,
-        compact_json(&turn.args),
-        compact_json(&turn.result)
-    )
 }
 
 fn render_interactive_shell_read_turn(turn: &ToolTurnContext) -> String {
@@ -355,6 +365,237 @@ fn render_interactive_shell_read_turn(turn: &ToolTurnContext) -> String {
         menu_block,
         screen_block
     )
+}
+
+fn render_mcp_tools_list_turn(turn: &ToolTurnContext) -> String {
+    let server = turn
+        .result
+        .get("server")
+        .and_then(Value::as_str)
+        .or_else(|| turn.args.get("server").and_then(Value::as_str))
+        .unwrap_or("server");
+    let tools = turn
+        .result
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| {
+            let mut rendered = items
+                .iter()
+                .take(40)
+                .filter_map(|item| {
+                    let name = item.get("name").and_then(Value::as_str)?;
+                    let signature = render_mcp_tool_signature(item);
+                    let description = item
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    Some(if description.is_empty() {
+                        format!("- {name}{signature}")
+                    } else {
+                        format!("- {name}{signature}: {description}")
+                    })
+                })
+                .collect::<Vec<_>>();
+            if items.len() > 40 {
+                rendered.push(format!("...and {} more", items.len() - 40));
+            }
+            rendered.join("\n")
+        })
+        .unwrap_or_default();
+    let tools_block = if tools.is_empty() { "<none>" } else { &tools };
+    format!(
+        "TOOL_RESULT: mcp_tools_list {}\nserver={}\nmcp_tools:\n{}\n[end mcp_tools]",
+        compact_json(&turn.args),
+        server,
+        tools_block
+    )
+}
+
+fn render_mcp_resources_list_turn(turn: &ToolTurnContext) -> String {
+    let server = turn
+        .result
+        .get("server")
+        .and_then(Value::as_str)
+        .or_else(|| turn.args.get("server").and_then(Value::as_str))
+        .unwrap_or("server");
+    let resources = turn
+        .result
+        .get("resources")
+        .and_then(Value::as_array)
+        .map(|items| {
+            let mut rendered = items
+                .iter()
+                .take(40)
+                .filter_map(|item| {
+                    let uri = item.get("uri").and_then(Value::as_str)?;
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    Some(if name.is_empty() {
+                        format!("- {uri}")
+                    } else {
+                        format!("- {uri}: {name}")
+                    })
+                })
+                .collect::<Vec<_>>();
+            if items.len() > 40 {
+                rendered.push(format!("...and {} more", items.len() - 40));
+            }
+            rendered.join("\n")
+        })
+        .unwrap_or_default();
+    let resources_block = if resources.is_empty() {
+        "<none>"
+    } else {
+        &resources
+    };
+    format!(
+        "TOOL_RESULT: mcp_resources_list {}\nserver={}\nmcp_resources:\n{}\n[end mcp_resources]",
+        compact_json(&turn.args),
+        server,
+        resources_block
+    )
+}
+
+fn render_mcp_tool_call_turn(turn: &ToolTurnContext) -> String {
+    let server = turn
+        .result
+        .get("server")
+        .and_then(Value::as_str)
+        .or_else(|| turn.args.get("server").and_then(Value::as_str))
+        .unwrap_or("server");
+    let tool = turn
+        .result
+        .get("tool")
+        .and_then(Value::as_str)
+        .or_else(|| turn.args.get("tool").and_then(Value::as_str))
+        .unwrap_or("tool");
+    let requested_tool = turn
+        .result
+        .get("requested_tool")
+        .and_then(Value::as_str)
+        .unwrap_or(tool);
+    let is_error = turn
+        .result
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let text = turn
+        .result
+        .get("content_text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let needs_recovery_hint = is_error
+        && text.to_ascii_lowercase().contains("tool")
+        && text.to_ascii_lowercase().contains("not found");
+    let needs_validation_hint = is_error
+        && (text.to_ascii_lowercase().contains("invalid arguments")
+            || text.to_ascii_lowercase().contains("input validation error"));
+    let mut hints = Vec::new();
+    if needs_recovery_hint {
+        hints.push(
+            "The previous nested MCP tool name was invalid.\nDo not invent another name.\nReuse one of the exact names from the latest mcp_tools_list result for this server.".to_string(),
+        );
+    }
+    if needs_validation_hint {
+        hints.push(
+            "The nested MCP arguments did not match the tool schema.\nUse the latest mcp_tools_list signature for this server and match the argument shape exactly.".to_string(),
+        );
+    }
+    let recovery_hint = if hints.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nrecovery_hint:\n{}\n[end recovery_hint]",
+            hints.join("\n")
+        )
+    };
+    let requested_note = if requested_tool != tool {
+        format!(" requested_tool={requested_tool}")
+    } else {
+        String::new()
+    };
+    if text.is_empty() {
+        return format!(
+            "TOOL_RESULT: mcp_tool_call {}\nserver={} tool={}{} is_error={}\nraw_result={}{}",
+            compact_json(&turn.args),
+            server,
+            tool,
+            requested_note,
+            is_error,
+            compact_json(&turn.result),
+            recovery_hint
+        );
+    }
+    format!(
+        "TOOL_RESULT: mcp_tool_call {}\nserver={} tool={}{} is_error={}\ncontent_text:\n{}\n[end content_text]{}",
+        compact_json(&turn.args),
+        server,
+        tool,
+        requested_note,
+        is_error,
+        limit_screen_text(text, 4000),
+        recovery_hint
+    )
+}
+
+fn render_mcp_tool_signature(tool: &Value) -> String {
+    let Some(schema) = tool.get("inputSchema") else {
+        return String::new();
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return String::new();
+    };
+    if properties.is_empty() {
+        return "()".into();
+    }
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let rendered = properties
+        .iter()
+        .map(|(name, property)| {
+            let optional = if required.contains(name.as_str()) {
+                ""
+            } else {
+                "?"
+            };
+            format!("{name}{optional}:{}", render_json_schema_type(property))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({rendered})")
+}
+
+fn render_json_schema_type(schema: &Value) -> String {
+    if let Some(kind) = schema.get("type").and_then(Value::as_str) {
+        return match kind {
+            "array" => {
+                let item_type = schema
+                    .get("items")
+                    .map(render_json_schema_type)
+                    .unwrap_or_else(|| "any".into());
+                format!("{item_type}[]")
+            }
+            other => other.to_string(),
+        };
+    }
+    if schema.get("enum").and_then(Value::as_array).is_some() {
+        return "enum".into();
+    }
+    if schema.get("oneOf").and_then(Value::as_array).is_some()
+        || schema.get("anyOf").and_then(Value::as_array).is_some()
+    {
+        return "variant".into();
+    }
+    "any".into()
 }
 
 fn render_task_directive(directive: TaskDirectiveContext) -> String {
@@ -697,5 +938,104 @@ mod tests {
         assert!(prompt.contains("menu_options:\n1. Yes\n2. No"));
         assert!(prompt.contains("...[truncated]"));
         assert!(prompt.contains("screen_tail:"));
+    }
+
+    #[test]
+    fn mcp_tool_turns_render_exact_nested_tool_names_and_protocol_rules() {
+        let turns = vec![
+            ToolTurnContext {
+                tool: "mcp_tools_list".into(),
+                args: json!({"server":"docs"}),
+                result: json!({
+                    "server": "docs",
+                    "tools": [
+                        {
+                            "name": "new_page",
+                            "description": "Open a new page.",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        },
+                        {
+                            "name": "take_snapshot",
+                            "description": "Capture a snapshot.",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        }
+                    ]
+                }),
+            },
+            ToolTurnContext {
+                tool: "mcp_tool_call".into(),
+                args: json!({"server":"docs","tool":"take_snapshot","arguments":{}}),
+                result: json!({
+                    "server": "docs",
+                    "tool": "take_snapshot",
+                    "is_error": false,
+                    "content_text": "snapshot ready"
+                }),
+            },
+        ];
+        let prompt = build_chat_execution_prompt(
+            "Question: inspect with docs mcp",
+            "",
+            &[sample_tool()],
+            true,
+            true,
+            &turns,
+            None,
+        );
+        assert!(prompt.contains("For MCP servers, never invent nested tool names."));
+        assert!(
+            prompt.contains("Do not keep guessing short aliases like open, snapshot, or extract")
+        );
+        assert!(
+            prompt.contains("Match nested MCP arguments to the latest mcp_tools_list signature")
+        );
+        assert!(prompt.contains(
+            "mcp_tools:\n- new_page(): Open a new page.\n- take_snapshot(): Capture a snapshot."
+        ));
+        assert!(prompt.contains("server=docs tool=take_snapshot is_error=false"));
+        assert!(prompt.contains("content_text:\nsnapshot ready"));
+    }
+
+    #[test]
+    fn mcp_tool_errors_include_recovery_hint() {
+        let turns = vec![
+            ToolTurnContext {
+                tool: "mcp_tools_list".into(),
+                args: json!({"server":"docs"}),
+                result: json!({
+                    "server": "docs",
+                    "tools": [
+                        {
+                            "name": "new_page",
+                            "description": "Open a new page.",
+                            "inputSchema": { "type": "object", "properties": {} }
+                        }
+                    ]
+                }),
+            },
+            ToolTurnContext {
+                tool: "mcp_tool_call".into(),
+                args: json!({"server":"docs","tool":"open","arguments":{}}),
+                result: json!({
+                    "server": "docs",
+                    "tool": "open",
+                    "is_error": true,
+                    "content_text": "MCP error -32602: Tool open not found"
+                }),
+            },
+        ];
+        let prompt = build_chat_execution_prompt(
+            "Question: inspect with docs mcp",
+            "",
+            &[sample_tool()],
+            true,
+            true,
+            &turns,
+            None,
+        );
+        assert!(prompt.contains("The previous nested MCP tool name was invalid."));
+        assert!(
+            prompt.contains("Reuse one of the exact names from the latest mcp_tools_list result")
+        );
     }
 }

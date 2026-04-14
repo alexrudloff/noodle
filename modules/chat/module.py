@@ -54,6 +54,14 @@ def host_binary(request):
     )
 
 
+def module_api_prefix(request):
+    module_api = ((request.get("host") or {}).get("module_api")) or {}
+    prefix = module_api.get("command_prefix")
+    if isinstance(prefix, list) and prefix:
+        return prefix
+    return [host_binary(request), "module-api"]
+
+
 def host_env():
     env = os.environ.copy()
     env["NOODLE_BYPASS_DAEMON"] = "1"
@@ -61,7 +69,7 @@ def host_env():
 
 
 def run_host(request, args, input_text=None):
-    command = [host_binary(request)] + args
+    command = module_api_prefix(request) + args
     result = subprocess.run(
         command,
         input=input_text,
@@ -77,7 +85,7 @@ def run_host(request, args, input_text=None):
 
 
 def stream_host(request, args, input_text, on_line):
-    command = [host_binary(request)] + args
+    command = module_api_prefix(request) + args
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,

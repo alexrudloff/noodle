@@ -31,10 +31,11 @@ Three pieces, one real module host:
    - `artifacts` (compiled memory objects, incl. task records)
 
 Six first-party modules ship today: `utils`, `memory`, `scripting`, `todo`,
-`chat`, and `typos`. The daemon is now a hybrid host: it can discover packaged
-external modules from `modules/` / `~/.noodle/modules`. All six first-party
-modules now ship as packaged modules. The daemon remains the host for tools,
-permissions, shared memory, task persistence, and provider calls.
+`chat`, and `typos`. The daemon discovers packaged external modules from
+`modules/` / `~/.noodle/modules`. All six first-party modules now ship as
+packaged modules. The daemon remains the host for tools, permissions, shared
+memory, task persistence, provider calls, and the versioned `module-api`
+surface.
 
 ## Key modules
 
@@ -99,6 +100,9 @@ Single binary `noodle` with subcommands (see `parse_args` in
 - `noodle config-value --config ... --key ... [--fallback ...]` /
   `config-list` — extract config values for the `zsh` adapter.
 - `noodle payload-fields [--payload ...]` — parse adapter payloads.
+- `noodle module-api <subcommand> ...` — stable host surface for packaged
+  modules (`info`, model output, execution helpers, memory helpers, workspace
+  context, tool passthrough).
 - `noodle tool-list --config ... [--plugin chat]` — list registered tools.
 - `noodle tool-call --config ... --tool ... --args '<json>'` — invoke one.
 - `noodle tool-batch --config ... --calls '<json array>'` — batch invoke
@@ -203,8 +207,8 @@ Rust edition 2024. Single binary crate, no workspace.
 From README "Not done" and observable state:
 
 - Broad `zsh` event forwarding beyond the current small set.
-- Third-party module API — the first-party packaged modules work, but the host
-  API is still evolving and not yet a polished public extension contract.
+- Third-party module API — `v1` is now explicit and documented, but the host
+  capability set will likely expand as more extension use cases show up.
 - Richer daemon lifecycle management (the `launchctl` plist is the entire
   story).
 - Memory linting / maintenance passes.

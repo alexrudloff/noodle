@@ -29,6 +29,7 @@ pub struct ChatExecutionConfig {
     pub max_tool_rounds: usize,
     pub max_replans: usize,
     pub available_tools: Vec<ToolDefinition>,
+    pub granted_tool_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +102,8 @@ pub fn resume_chat_execution_from_permission(
         });
     }
 
-    let request = snapshot_to_request(&pending.request);
+    let mut request = snapshot_to_request(&pending.request);
+    grant_tool_permission(&mut request, &pending.pending_step.tool);
     let mut turns = snapshots_to_turns(&pending.tool_turns);
     let mut progress = Vec::new();
     if let Some(action) = emit_tool_running(
@@ -630,6 +632,36 @@ fn continue_tool_loop_with_step(
     )? {
         return Ok(finalize_action(progress, action, streaming));
     }
+    let normalized_args = prepare_builtin_tool_args(&name, &args, Some(&request.working_directory));
+    if let Some(reason) = duplicate_tool_step_reason(request, &turns, &name, &normalized_args) {
+        let action = DaemonAction::ToolStep {
+            plugin: request.plugin.clone(),
+            tool: name.clone(),
+            status: "failed".into(),
+            summary: reason.clone(),
+        };
+        emit_action(emitter, &action, streaming)?;
+        progress.push(action);
+        turns.push(ToolTurn {
+            tool: name.clone(),
+            args: normalized_args,
+            result: ToolCallResult {
+                tool: name,
+                ok: false,
+                output: json!({ "error": reason, "duplicate_call": true }),
+            },
+        });
+        return execute_tool_loop(
+            config,
+            request,
+            turns,
+            remaining_rounds,
+            progress,
+            streaming,
+            emitter,
+            model_output,
+        );
+    }
     if let Some(action) = emit_tool_running(emitter, request, &name, &args, streaming)? {
         progress.push(action);
     }
@@ -680,6 +712,32 @@ fn maybe_return_raw_tool_result(
         plugin: request.plugin.clone(),
         message: content.to_string(),
     })
+}
+
+fn duplicate_tool_step_reason(
+    request: &ChatExecutionConfig,
+    turns: &[ToolTurn],
+    tool: &str,
+    normalized_args: &Value,
+) -> Option<String> {
+    let last = turns.last()?;
+    if last.tool != tool || last.args != *normalized_args || !last.result.ok {
+        return None;
+    }
+    if matches!(tool, "interactive_shell_read") {
+        return None;
+    }
+    let lowered = request.input.to_lowercase();
+    if ["again", "retry", "rerun", "repeat"]
+        .iter()
+        .any(|token| lowered.contains(token))
+    {
+        return None;
+    }
+    Some(
+        "Skipped an identical repeated tool call. Use the previous result or choose a different next step."
+            .into(),
+    )
 }
 
 fn verify_direct_final(
@@ -2037,6 +2095,9 @@ fn maybe_request_permission(
     pending_step: TaskStep,
     continuation: PendingContinuation,
 ) -> Result<Option<DaemonAction>, String> {
+    if tool_permission_is_granted(request, &pending_step.tool) {
+        return Ok(None);
+    }
     match permission_decision_for_tool(config, &pending_step.tool) {
         ToolPermissionDecision::Allow => Ok(None),
         ToolPermissionDecision::Deny => Ok(Some(DaemonAction::Ask {
@@ -2054,9 +2115,12 @@ fn maybe_request_permission(
                 tool: pending_step.tool.clone(),
                 permission_class: permission_class.clone(),
                 summary: if permission_class == "interactive_shell" {
-                    "Allow interactive shell?".into()
+                    "Allow interactive shell for the rest of this task?".into()
                 } else {
-                    format!("Allow {} to use {}?", request.plugin, pending_step.tool)
+                    format!(
+                        "Allow {} to use {} for the rest of this task?",
+                        request.plugin, pending_step.tool
+                    )
                 },
                 request: request_to_snapshot(request),
                 tool_turns: turns.iter().map(tool_turn_to_snapshot).collect(),
@@ -2072,6 +2136,16 @@ fn maybe_request_permission(
                 summary: pending.summary,
             }))
         }
+    }
+}
+
+fn tool_permission_is_granted(request: &ChatExecutionConfig, tool: &str) -> bool {
+    request.granted_tool_names.iter().any(|name| name == tool)
+}
+
+fn grant_tool_permission(request: &mut ChatExecutionConfig, tool: &str) {
+    if !tool_permission_is_granted(request, tool) {
+        request.granted_tool_names.push(tool.to_string());
     }
 }
 
@@ -2599,6 +2673,12 @@ fn tool_running_summary(tool: &str, args: &Value) -> String {
         ),
         "interactive_shell_close" => "Closing interactive shell".into(),
         "memory_query" => "Querying noodle memory".into(),
+        "mcp_tools_list" => "Listing MCP tools".into(),
+        "mcp_tool_call" => format!(
+            "Calling MCP tool {}",
+            compact_text(args.get("tool").and_then(Value::as_str).unwrap_or("tool"))
+        ),
+        "mcp_resources_list" => "Listing MCP resources".into(),
         "mcp_resource_read" => "Reading MCP resource".into(),
         "task_note_write" => "Writing task note".into(),
         "agent_handoff_create" => "Creating agent handoff".into(),
@@ -2714,6 +2794,33 @@ fn tool_done_summary(tool: &str, args: &Value, result: &ToolCallResult) -> Strin
         ),
         "interactive_shell_close" => "Interactive shell closed".into(),
         "memory_query" => "Loaded noodle memory".into(),
+        "mcp_tools_list" => {
+            let tools = output
+                .get("tools")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0);
+            format!("Loaded {} MCP tool(s)", tools)
+        }
+        "mcp_tool_call" => {
+            let text = output
+                .get("content_text")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if text.trim().is_empty() {
+                "MCP tool call completed".into()
+            } else {
+                format!("MCP result: {}", compact_text(text))
+            }
+        }
+        "mcp_resources_list" => {
+            let resources = output
+                .get("resources")
+                .and_then(Value::as_array)
+                .map(|items| items.len())
+                .unwrap_or(0);
+            format!("Loaded {} MCP resource(s)", resources)
+        }
         "mcp_resource_read" => "Loaded MCP resource".into(),
         "task_note_write" => "Task note written".into(),
         "agent_handoff_create" => "Agent handoff created".into(),
@@ -2908,6 +3015,7 @@ fn request_to_snapshot(request: &ChatExecutionConfig) -> ChatExecutionSnapshot {
             .iter()
             .map(|tool| tool.name.to_string())
             .collect(),
+        granted_tool_names: request.granted_tool_names.clone(),
     }
 }
 
@@ -2928,6 +3036,7 @@ fn snapshot_to_request(snapshot: &ChatExecutionSnapshot) -> ChatExecutionConfig 
             .iter()
             .filter_map(|name| tool_definition_by_name(name))
             .collect(),
+        granted_tool_names: snapshot.granted_tool_names.clone(),
     }
 }
 
@@ -2984,6 +3093,7 @@ mod tests {
             max_tool_rounds: 4,
             max_replans: 1,
             available_tools: vec![tool_definition_by_name("file_write").unwrap()],
+            granted_tool_names: Vec::new(),
         };
         assert!(required_tool_use_reason(&request).is_some());
 
@@ -3051,6 +3161,7 @@ mod tests {
             max_tool_rounds: 4,
             max_replans: 1,
             available_tools: vec![tool_definition_by_name("shell_exec").unwrap()],
+            granted_tool_names: Vec::new(),
         };
 
         let responses = RefCell::new(VecDeque::from(vec![
@@ -3086,6 +3197,72 @@ mod tests {
             prompts[1].contains("A meta reply like \"I need to inspect with tools first\" is not an acceptable final answer for this request.")
         );
         assert!(prompts[2].contains("You must produce a useful answer now."));
+
+        let _ = fs::remove_dir_all(&working_directory);
+    }
+
+    #[test]
+    fn duplicate_immediate_tool_calls_are_skipped() {
+        let working_directory = temp_dir("noodle-executor-duplicate-tool");
+        let input = "check the file once";
+        let request = ChatExecutionConfig {
+            plugin: "chat".into(),
+            input: input.into(),
+            working_directory: working_directory.display().to_string(),
+            base_prompt: build_chat_base_prompt(
+                "",
+                input,
+                &working_directory.display().to_string(),
+                "zsh",
+                "",
+                None,
+                &[],
+            ),
+            memory_context: String::new(),
+            include_tool_context: false,
+            tool_calling_enabled: true,
+            task_execution_enabled: true,
+            max_tool_rounds: 4,
+            max_replans: 1,
+            available_tools: vec![tool_definition_by_name("shell_exec").unwrap()],
+            granted_tool_names: Vec::new(),
+        };
+
+        let responses = RefCell::new(VecDeque::from(vec![
+            "TOOL: shell_exec {\"command\":\"printf one >> duplicate.txt\"}".to_string(),
+            "TOOL: shell_exec {\"command\":\"printf one >> duplicate.txt\"}".to_string(),
+            "FINAL: done".to_string(),
+        ]));
+        let prompts = RefCell::new(Vec::new());
+        let config = json!({
+            "permissions": {
+                "classes": {
+                    "shell_exec": "allow"
+                }
+            }
+        });
+        let mut noop = |_action: &crate::actions::DaemonAction| Ok(());
+        let action = run_chat_execution(&config, request, false, &mut noop, &|prompt| {
+            prompts.borrow_mut().push(prompt.to_string());
+            responses
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| "missing stub response".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(action.primary_text().as_deref(), Some("done"));
+        assert_eq!(
+            fs::read_to_string(working_directory.join("duplicate.txt")).unwrap(),
+            "one"
+        );
+        assert!(
+            prompts
+                .borrow()
+                .iter()
+                .any(|prompt| prompt.contains("Skipped an identical repeated tool call")),
+            "expected duplicate-call hint in follow-up prompt"
+        );
 
         let _ = fs::remove_dir_all(&working_directory);
     }

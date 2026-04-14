@@ -32,6 +32,9 @@
       "search_lang": "en"
     }
   },
+  "mcp": {
+    "servers": {}
+  },
   "memory": {
     "path": "~/.noodle/memory.db",
     "chat": {
@@ -97,6 +100,9 @@
         "interactive_shell_write",
         "interactive_shell_key",
         "interactive_shell_close",
+        "mcp_tools_list",
+        "mcp_tool_call",
+        "mcp_resources_list",
         "mcp_resource_read",
         "task_note_write",
         "agent_handoff_create"
@@ -117,6 +123,9 @@
         "interactive_shell_write": true,
         "interactive_shell_key": true,
         "interactive_shell_close": true,
+        "mcp_tools_list": true,
+        "mcp_tool_call": true,
+        "mcp_resources_list": true,
         "mcp_resource_read": true,
         "task_note_write": true,
         "agent_handoff_create": true
