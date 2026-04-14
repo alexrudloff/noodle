@@ -28,14 +28,23 @@ function _noodle_install_cleanup() {
 
 function _noodle_install_resolve_repo_root() {
   local script_path="${0:A}"
+  local prompt_script_path="${${(%):-%N}:A}"
   local candidate=""
-  if [[ -f "${script_path}" ]]; then
-    candidate="${script_path:h:h}"
+  local -a local_candidates
+
+  local_candidates=(
+    "${NOODLE_INSTALL_SOURCE_DIR:-}"
+    "${PWD:A}"
+    "${script_path:h:h}"
+    "${prompt_script_path:h:h}"
+  )
+  for candidate in "${local_candidates[@]}"; do
+    [[ -n "${candidate}" ]] || continue
     if _noodle_install_is_repo_root "${candidate}"; then
       repo_root="${candidate:A}"
       return 0
     fi
-  fi
+  done
 
   local repo_slug="${NOODLE_INSTALL_REPO_SLUG:-alexrudloff/noodle}"
   local ref="${NOODLE_INSTALL_REF:-main}"
@@ -77,18 +86,24 @@ socket_path="${install_root}/noodle.sock"
 pid_path="${install_root}/noodle.pid"
 stdout_log="${install_root}/daemon.stdout.log"
 stderr_log="${install_root}/daemon.stderr.log"
+zshrc_path="${ZDOTDIR:-${HOME}}/.zshrc"
 daemon_command="export NOODLE_PIDFILE='${pid_path}'; exec '${install_root}/bin/noodle' daemon --socket '${socket_path}'"
 launchctl_domain="gui/$(id -u)"
+launchctl_bin="${NOODLE_LAUNCHCTL_BIN:-launchctl}"
 
 cd "${repo_root}"
 cargo build --release
 
 mkdir -p "${install_root}/bin"
-rm -rf "${install_root}/plugin" "${install_root}/config" "${install_root}/modules"
+mkdir -p "${install_root}/scripts"
+rm -rf "${install_root}/plugin" "${install_root}/config" "${install_root}/modules" "${install_root}/scripts"
 rm -f "${socket_path}" "${pid_path}"
 cp -R "${repo_root}/plugin" "${install_root}/plugin"
 cp -R "${repo_root}/config" "${install_root}/config"
 cp -R "${repo_root}/modules" "${install_root}/modules"
+mkdir -p "${install_root}/scripts"
+cp "${repo_root}/scripts/install.sh" "${install_root}/scripts/install.sh"
+cp "${repo_root}/scripts/uninstall.sh" "${install_root}/scripts/uninstall.sh"
 cp "${repo_root}/target/release/noodle" "${install_root}/bin/noodle"
 codesign --force --sign - "${install_root}/bin/noodle" >/dev/null 2>&1
 
@@ -457,6 +472,44 @@ maybe_prompt_llm_settings(data, config_created)
 path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
+python3 - "${zshrc_path}" "${install_root}" <<'PY'
+from pathlib import Path
+import sys
+
+zshrc_path = Path(sys.argv[1]).expanduser()
+install_root = Path(sys.argv[2]).expanduser()
+start_marker = "# >>> noodle shell integration >>>"
+end_marker = "# <<< noodle shell integration <<<"
+integration_line = f'source "{install_root}/plugin/noodle.plugin.zsh"'
+
+if zshrc_path.exists():
+    lines = zshrc_path.read_text().splitlines()
+else:
+    lines = []
+
+filtered = []
+inside_block = False
+for line in lines:
+    stripped = line.strip()
+    if stripped == start_marker:
+        inside_block = True
+        continue
+    if stripped == end_marker:
+        inside_block = False
+        continue
+    if inside_block:
+        continue
+    if "noodle.plugin.zsh" in stripped and stripped.startswith("source "):
+        continue
+    filtered.append(line)
+
+if filtered and filtered[-1].strip():
+    filtered.append("")
+filtered.extend([start_marker, integration_line, end_marker])
+zshrc_path.parent.mkdir(parents=True, exist_ok=True)
+zshrc_path.write_text("\n".join(filtered) + "\n")
+PY
+
 mkdir -p "${launch_agent_dir}"
 cat > "${launch_agent_plist}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -485,16 +538,14 @@ cat > "${launch_agent_plist}" <<EOF
 </plist>
 EOF
 
-launchctl bootout "${launchctl_domain}" "${launch_agent_plist}" >/dev/null 2>&1 || true
-launchctl bootstrap "${launchctl_domain}" "${launch_agent_plist}"
-launchctl kickstart -k "${launchctl_domain}/${launch_agent_label}" >/dev/null 2>&1 || true
+"${launchctl_bin}" bootout "${launchctl_domain}/${launch_agent_label}" >/dev/null 2>&1 || true
+"${launchctl_bin}" bootout "${launchctl_domain}" "${launch_agent_plist}" >/dev/null 2>&1 || true
+"${launchctl_bin}" remove "${launch_agent_label}" >/dev/null 2>&1 || true
+"${launchctl_bin}" bootstrap "${launchctl_domain}" "${launch_agent_plist}"
+"${launchctl_bin}" kickstart -k "${launchctl_domain}/${launch_agent_label}" >/dev/null 2>&1 || true
 
 cat <<'EOF'
 Installed noodle.
-
-Add this to ~/.zshrc:
-
-source "$HOME/.noodle/plugin/noodle.plugin.zsh"
 
 Optional:
 export NOODLE_CONFIG="$HOME/.noodle/config.json"
@@ -507,3 +558,15 @@ EOF
 
 printf '\nInstalled files at: %s\n' "${install_root}"
 printf 'Launch agent: %s\n' "${launch_agent_plist}"
+printf 'Shell rc: %s\n' "${zshrc_path}"
+printf '\nSay hello to noodle with:\n'
+printf "oo hello! my name is %s\n" "${USER:-there}"
+
+if [[ "${NOODLE_INSTALL_SKIP_SHELL_RELOAD:-0}" != "1" ]] && { : </dev/tty >/dev/tty; } 2>/dev/null; then
+  print
+  print -- "Reloading zsh so oo is available now..."
+  exec zsh -i </dev/tty >/dev/tty 2>/dev/tty
+fi
+
+print
+print -- "Run 'exec zsh' to load noodle in this shell, then say: oo hello! my name is ${USER:-there}"

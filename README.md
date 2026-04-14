@@ -99,13 +99,9 @@ The installer:
 3. Copies packaged modules into `~/.noodle/modules`.
 4. Drops a launch agent at `~/Library/LaunchAgents/com.noodle.daemon.plist`.
 5. Bootstraps and kickstarts the daemon via `launchctl`.
-6. On install, prompts for provider / model / API key and writes `~/.noodle/config.json`.
-
-Then add this to your `~/.zshrc`:
-
-```sh
-source "$HOME/.noodle/plugin/noodle.plugin.zsh"
-```
+6. Ensures shell integration is present in `~/.zshrc`.
+7. On install, prompts for provider / model / API key and writes `~/.noodle/config.json`.
+8. Reloads `zsh` automatically when installed from an interactive terminal so `oo` works immediately.
 
 <details>
 <summary><b>Non-interactive install</b></summary>
@@ -128,6 +124,12 @@ zsh <(curl -fsSL https://raw.githubusercontent.com/alexrudloff/noodle/main/scrip
 Config lives at `~/.noodle/config.json`.
 
 </details>
+
+After install, say hello with:
+
+```sh
+oo hello! my name is Alex
+```
 
 ---
 

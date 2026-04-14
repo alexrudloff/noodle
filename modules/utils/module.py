@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import shlex
 import sys
 
 UTILS_PLUGIN = "utils"
@@ -99,6 +100,112 @@ def resolved_config_path(request):
         request.get("config_path")
         or os.environ.get("NOODLE_CONFIG")
         or "~/.noodle/config.json"
+    )
+
+
+def resolved_install_root(request):
+    override = os.environ.get("NOODLE_INSTALL_ROOT")
+    if override:
+        return expand_home(override)
+    return os.path.dirname(resolved_config_path(request))
+
+
+def installed_script_path(request, script_name):
+    return os.path.join(resolved_install_root(request), "scripts", script_name)
+
+
+def shell_quote(value):
+    return shlex.quote(value)
+
+
+def update_command(request):
+    script_path = installed_script_path(request, "install.sh")
+    if os.path.exists(script_path):
+        return f"NOODLE_INSTALL_CONFIGURE_LLM=0 zsh {shell_quote(script_path)}"
+    return "\n".join(
+        [
+            "(",
+            "  set -e",
+            '  tmp="$(mktemp -d "${TMPDIR:-/tmp}/noodle-update.XXXXXX")"',
+            '  trap \'rm -rf "$tmp"\' EXIT',
+            '  slug="${NOODLE_INSTALL_REPO_SLUG:-alexrudloff/noodle}"',
+            '  ref="${NOODLE_INSTALL_REF:-main}"',
+            '  archive_url="${NOODLE_INSTALL_ARCHIVE_URL:-https://codeload.github.com/${slug}/tar.gz/${ref}}"',
+            '  curl -fsSL "$archive_url" -o "$tmp/noodle.tar.gz"',
+            '  tar -xzf "$tmp/noodle.tar.gz" -C "$tmp"',
+            '  NOODLE_INSTALL_CONFIGURE_LLM=0 NOODLE_INSTALL_REPO_SLUG="$slug" NOODLE_INSTALL_REF="$ref" NOODLE_INSTALL_ARCHIVE_URL="$archive_url" zsh "$tmp"/*/scripts/install.sh',
+            ")",
+        ]
+    )
+
+
+def uninstall_command(request):
+    script_path = installed_script_path(request, "uninstall.sh")
+    if os.path.exists(script_path):
+        return f"zsh {shell_quote(script_path)} && exec zsh"
+    install_root = shell_quote(resolved_install_root(request))
+    return "\n".join(
+        [
+            "(",
+            f"  install_root={install_root}",
+            '  launchctl_bin="${NOODLE_LAUNCHCTL_BIN:-launchctl}"',
+            '  launch_agent_label="com.noodle.daemon"',
+            '  launch_agent_plist="$HOME/Library/LaunchAgents/${launch_agent_label}.plist"',
+            '  launchctl_domain="gui/$(id -u)"',
+            '  if [[ "${NOODLE_UNINSTALL_YES:-0}" != "1" ]]; then',
+            '    if [[ -r /dev/tty && -w /dev/tty ]]; then',
+            '      print -n -- "Remove noodle from ${install_root}? [Y/n]: " >/dev/tty',
+            '      read -r reply </dev/tty',
+            '      case "${reply:l}" in',
+            '        ""|y|yes) ;;',
+            '        *) print "Cancelled."; exit 1 ;;',
+            '      esac',
+            "    else",
+            '      print -u2 -- "Set NOODLE_UNINSTALL_YES=1 to uninstall when no terminal is available."',
+            "      exit 1",
+            "    fi",
+            "  fi",
+            '  "${launchctl_bin}" bootout "${launchctl_domain}/${launch_agent_label}" >/dev/null 2>&1 || true',
+            '  "${launchctl_bin}" bootout "${launchctl_domain}" "${launch_agent_plist}" >/dev/null 2>&1 || true',
+            '  "${launchctl_bin}" remove "${launch_agent_label}" >/dev/null 2>&1 || true',
+            '  python3 - "${ZDOTDIR:-${HOME}}/.zshrc" "${install_root}" <<'"'"'PY'"'"'',
+            'from pathlib import Path',
+            'import sys',
+            '',
+            'zshrc_path = Path(sys.argv[1]).expanduser()',
+            'install_root = Path(sys.argv[2]).expanduser()',
+            'start_marker = "# >>> noodle shell integration >>>"',
+            'end_marker = "# <<< noodle shell integration <<<"',
+            'legacy_target = str(install_root / "plugin" / "noodle.plugin.zsh")',
+            '',
+            'if zshrc_path.exists():',
+            '    lines = zshrc_path.read_text().splitlines()',
+            '    filtered = []',
+            '    inside_block = False',
+            '    for line in lines:',
+            '        stripped = line.strip()',
+            '        if stripped == start_marker:',
+            '            inside_block = True',
+            '            continue',
+            '        if stripped == end_marker:',
+            '            inside_block = False',
+            '            continue',
+            '        if inside_block:',
+            '            continue',
+            '        if "noodle.plugin.zsh" in stripped and stripped.startswith("source "):',
+            '            if legacy_target in stripped or "$HOME/.noodle/plugin/noodle.plugin.zsh" in stripped:',
+            '                continue',
+            '        filtered.append(line)',
+            '    while filtered and not filtered[-1].strip():',
+            '        filtered.pop()',
+            '    zshrc_path.write_text(("\\n".join(filtered) + "\\n") if filtered else "")',
+            'PY',
+            '  rm -f "${launch_agent_plist}"',
+            '  rm -rf "${install_root}"',
+            '  print "Removed noodle from ${install_root}."',
+            '  print "Removed noodle shell integration from ${ZDOTDIR:-${HOME}}/.zshrc."',
+            ") && exec zsh",
+        ]
     )
 
 
@@ -237,6 +344,20 @@ def handle_command(request):
             "action": "message",
             "plugin": UTILS_PLUGIN,
             "message": handle_config_command(request, raw_input[len("/config") :].strip()),
+        }
+    if raw_input == "/update":
+        return {
+            "action": "run",
+            "plugin": UTILS_PLUGIN,
+            "command": update_command(request),
+            "explanation": "Updating noodle in place.",
+        }
+    if raw_input == "/uninstall":
+        return {
+            "action": "run",
+            "plugin": UTILS_PLUGIN,
+            "command": uninstall_command(request),
+            "explanation": "Uninstalling noodle after confirmation.",
         }
     raise ValueError(f"Unknown utils command: {raw_input}")
 

@@ -22,6 +22,16 @@
       "name": "config",
       "description": "Inspect or update noodle config from the terminal.",
       "usage": "/config [help|show|get|set|unset] ..."
+    },
+    {
+      "name": "update",
+      "description": "Update noodle in place using the installed updater or GitHub archive bootstrap.",
+      "usage": "/update"
+    },
+    {
+      "name": "uninstall",
+      "description": "Uninstall noodle after an interactive confirmation prompt.",
+      "usage": "/uninstall"
     }
   ],
   "uses_tools": [],

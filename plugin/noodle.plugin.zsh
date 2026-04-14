@@ -84,7 +84,7 @@ function _noodle_load_runtime_config() {
   [[ -n "$NOODLE_MAX_RETRY_DEPTH" ]] || NOODLE_MAX_RETRY_DEPTH=2
   [[ -n "$NOODLE_PLUGIN_ORDER" ]] || NOODLE_PLUGIN_ORDER="utils memory scripting todo chat typos"
   [[ -n "$NOODLE_SELECTION_MODE" ]] || NOODLE_SELECTION_MODE="select"
-  [[ -n "$NOODLE_SLASH_COMMANDS" ]] || NOODLE_SLASH_COMMANDS="help status reload config memory kv todo"
+  [[ -n "$NOODLE_SLASH_COMMANDS" ]] || NOODLE_SLASH_COMMANDS="help status reload config update uninstall memory kv todo"
   [[ -n "$NOODLE_CHAT_PREFIX_VALUE" ]] || NOODLE_CHAT_PREFIX_VALUE=","
   NOODLE_RUNTIME_LOADED=1
 }
@@ -691,12 +691,14 @@ function _noodle_registered_slash_command_name() {
   name="${name%%[[:space:]]*}"
   [[ -n "$name" ]] || return 1
   [[ "$name" != */* ]] || return 1
-  case "$name" in
-    help|status|reload|config|memory|kv|todo)
+  [[ -n "$NOODLE_SLASH_COMMANDS" ]] || _noodle_load_runtime_config
+  local registered
+  for registered in ${(z)NOODLE_SLASH_COMMANDS}; do
+    if [[ "$registered" == "$name" ]]; then
       print -r -- "$name"
       return 0
-      ;;
-  esac
+    fi
+  done
   return 1
 }
 

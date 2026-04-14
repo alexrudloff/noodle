@@ -748,6 +748,7 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
     let home = temp.path().join("home");
     let install_root = temp.path().join("install-root");
     let fake_bin = temp.path().join("fake-bin");
+    let launchctl_log = temp.path().join("launchctl.log");
     let archive_root = temp.path().join("archive-src");
     let repo_root = archive_root.join("noodle-main");
     let archive_path = temp.path().join("noodle-main.tar.gz");
@@ -763,6 +764,11 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
     fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install.sh"),
         repo_root.join("scripts/install.sh"),
+    )
+    .unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/uninstall.sh"),
+        repo_root.join("scripts/uninstall.sh"),
     )
     .unwrap();
     fs::write(
@@ -782,7 +788,13 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
         "#!/bin/sh\nset -eu\nif [ \"$1\" = \"build\" ] && [ \"$2\" = \"--release\" ]; then\n  mkdir -p target/release\n  printf '#!/bin/sh\\nexit 0\\n' > target/release/noodle\n  chmod +x target/release/noodle\n  exit 0\nfi\nprintf 'unexpected cargo args: %s\\n' \"$*\" >&2\nexit 1\n",
     );
     write_executable(&fake_bin.join("codesign"), "#!/bin/sh\nexit 0\n");
-    write_executable(&fake_bin.join("launchctl"), "#!/bin/sh\nexit 0\n");
+    write_executable(
+        &fake_bin.join("launchctl"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            launchctl_log.display()
+        ),
+    );
 
     let tar_status = Command::new("tar")
         .arg("-czf")
@@ -809,6 +821,7 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
         .env("INSTALL_SCRIPT_URL", install_script_url)
         .env("NOODLE_INSTALL_ARCHIVE_URL", archive_url)
         .env("NOODLE_INSTALL_ROOT", &install_root)
+        .env("NOODLE_LAUNCHCTL_BIN", fake_bin.join("launchctl"))
         .env("NOODLE_INSTALL_CONFIGURE_LLM", "0")
         .output()
         .unwrap();
@@ -829,11 +842,55 @@ fn installer_bootstraps_from_archive_when_piped_over_curl() {
         "expected installer success output, got:\n{}",
         combined
     );
+    assert!(
+        combined.contains("oo hello! my name is"),
+        "expected installer hello prompt, got:\n{}",
+        combined
+    );
+    assert!(
+        combined.contains("Run 'exec zsh' to load noodle in this shell"),
+        "expected installer shell reload fallback, got:\n{}",
+        combined
+    );
     assert!(install_root.join("bin/noodle").exists());
     assert!(install_root.join("plugin/noodle.plugin.zsh").exists());
     assert!(install_root.join("config/config.example.json").exists());
     assert!(install_root.join("modules").exists());
+    assert!(install_root.join("scripts/install.sh").exists());
+    assert!(install_root.join("scripts/uninstall.sh").exists());
     assert!(home.join("Library/LaunchAgents/com.noodle.daemon.plist").exists());
+    let launchctl_calls = fs::read_to_string(&launchctl_log).unwrap();
+    assert!(
+        launchctl_calls.contains("bootout gui/"),
+        "{}",
+        launchctl_calls
+    );
+    assert!(
+        launchctl_calls.contains("remove com.noodle.daemon"),
+        "{}",
+        launchctl_calls
+    );
+    assert!(
+        launchctl_calls.contains("bootstrap gui/"),
+        "{}",
+        launchctl_calls
+    );
+    assert!(
+        launchctl_calls.contains("kickstart -k gui/"),
+        "{}",
+        launchctl_calls
+    );
+    let zshrc = fs::read_to_string(home.join(".zshrc")).unwrap();
+    assert!(
+        zshrc.contains("# >>> noodle shell integration >>>"),
+        "{}",
+        zshrc
+    );
+    assert!(
+        zshrc.contains("plugin/noodle.plugin.zsh"),
+        "{}",
+        zshrc
+    );
 
     let config: Value =
         serde_json::from_str(&fs::read_to_string(install_root.join("config.json")).unwrap())
@@ -1033,7 +1090,7 @@ fn slash_command_runtime_config_and_adapter_path_are_available() {
         .output()
         .unwrap();
     let runtime_text = String::from_utf8_lossy(&runtime.stdout);
-    assert!(runtime_text.contains("slash_commands=help status reload config memory kv todo"));
+    assert!(runtime_text.contains("slash_commands=help status reload config update uninstall memory kv todo"));
 
     let output = run_zsh(
         &temp,
@@ -1060,6 +1117,14 @@ fn utils_slash_commands_work_through_daemon() {
         "{help}"
     );
     assert!(
+        help_text.contains("/update - Update noodle in place using the installed updater or GitHub archive bootstrap."),
+        "{help}"
+    );
+    assert!(
+        help_text.contains("/uninstall - Uninstall noodle after an interactive confirmation prompt."),
+        "{help}"
+    );
+    assert!(
         help_text.contains("/memory - Inspect, search, or clear noodle memory state."),
         "{help}"
     );
@@ -1073,9 +1138,183 @@ fn utils_slash_commands_work_through_daemon() {
     assert!(status_text.contains("Noodle status"), "{status}");
     assert!(status_text.contains("Plugins:"), "{status}");
     assert!(
-        status_text.contains("Slash commands: /help /status /reload /config /memory /kv /todo"),
+        status_text.contains("Slash commands: /help /status /reload /config /update /uninstall /memory /kv /todo"),
         "{status}"
     );
+}
+
+#[test]
+fn utils_update_and_uninstall_commands_use_installed_scripts() {
+    let temp = TempDir::new("noodle-e2e-utils-update-uninstall");
+    let config = write_test_config(&temp, "auto");
+    let scripts_dir = temp.path().join("scripts");
+    fs::create_dir_all(&scripts_dir).unwrap();
+    fs::write(scripts_dir.join("install.sh"), "#!/bin/zsh\n").unwrap();
+    fs::write(scripts_dir.join("uninstall.sh"), "#!/bin/zsh\n").unwrap();
+
+    let update = run_mode(&temp, &config, "slash_command", "/update", None);
+    assert_eq!(update["action"].as_str(), Some("run"), "{update}");
+    assert_eq!(
+        update["explanation"].as_str(),
+        Some("Updating noodle in place."),
+        "{update}"
+    );
+    assert!(
+        update["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("scripts/install.sh"),
+        "{update}"
+    );
+    assert!(
+        update["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("NOODLE_INSTALL_CONFIGURE_LLM=0"),
+        "{update}"
+    );
+
+    let uninstall = run_mode(&temp, &config, "slash_command", "/uninstall", None);
+    assert_eq!(uninstall["action"].as_str(), Some("run"), "{uninstall}");
+    assert_eq!(
+        uninstall["explanation"].as_str(),
+        Some("Uninstalling noodle after confirmation."),
+        "{uninstall}"
+    );
+    assert!(
+        uninstall["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("scripts/uninstall.sh"),
+        "{uninstall}"
+    );
+    assert!(
+        uninstall["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("&& exec zsh"),
+        "{uninstall}"
+    );
+}
+
+#[test]
+fn utils_uninstall_fallback_defaults_prompt_to_yes() {
+    let temp = TempDir::new("noodle-e2e-utils-uninstall-fallback");
+    let config = write_test_config(&temp, "auto");
+    let uninstall = run_mode(&temp, &config, "slash_command", "/uninstall", None);
+    assert_eq!(uninstall["action"].as_str(), Some("run"), "{uninstall}");
+    let command = uninstall["command"].as_str().unwrap_or_default();
+    assert!(command.contains("Remove noodle from ${install_root}? [Y/n]"), "{uninstall}");
+    assert!(command.contains("\"\"|y|yes"), "{uninstall}");
+    assert!(command.contains("&& exec zsh"), "{uninstall}");
+}
+
+#[test]
+fn zsh_dispatches_update_and_uninstall_slash_commands() {
+    let temp = TempDir::new("noodle-zsh-update-uninstall");
+    let config = write_test_config(&temp, "auto");
+    let mut value: Value = serde_json::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+    value["runtime"]["auto_run"] = Value::from(0);
+    fs::write(&config, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+    let scripts_dir = temp.path().join("scripts");
+    fs::create_dir_all(&scripts_dir).unwrap();
+    fs::write(scripts_dir.join("install.sh"), "#!/bin/zsh\n").unwrap();
+    fs::write(scripts_dir.join("uninstall.sh"), "#!/bin/zsh\n").unwrap();
+
+    let output = run_zsh(
+        &temp,
+        &config,
+        "_noodle_dispatch_explicit_input '/update'; _noodle_dispatch_explicit_input '/uninstall'",
+    );
+    assert!(
+        output.contains("> NOODLE_INSTALL_CONFIGURE_LLM=0 zsh"),
+        "{}",
+        output
+    );
+    assert!(output.contains("scripts/install.sh"), "{}", output);
+    assert!(output.contains("> zsh"), "{}", output);
+    assert!(output.contains("scripts/uninstall.sh"), "{}", output);
+    assert!(output.contains("&& exec zsh"), "{}", output);
+}
+
+#[test]
+fn uninstall_script_removes_launch_agent_and_shell_integration() {
+    let temp = TempDir::new("noodle-uninstall-script");
+    let home = temp.path().join("home");
+    let install_root = temp.path().join("install-root");
+    let fake_bin = temp.path().join("fake-bin");
+    let log_path = temp.path().join("launchctl.log");
+    fs::create_dir_all(home.join("Library/LaunchAgents")).unwrap();
+    fs::create_dir_all(install_root.join("plugin")).unwrap();
+    fs::create_dir_all(install_root.join("config")).unwrap();
+    fs::create_dir_all(install_root.join("bin")).unwrap();
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::write(
+        home.join(".zshrc"),
+        format!(
+            "# >>> noodle shell integration >>>\nsource \"{}/plugin/noodle.plugin.zsh\"\n# <<< noodle shell integration >>>\n",
+            install_root.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("Library/LaunchAgents/com.noodle.daemon.plist"),
+        "<plist/>",
+    )
+    .unwrap();
+    write_executable(
+        &fake_bin.join("launchctl"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            log_path.display()
+        ),
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        fake_bin.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("/bin/zsh")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/uninstall.sh"))
+        .env("HOME", &home)
+        .env("PATH", path_env)
+        .env("NOODLE_INSTALL_ROOT", &install_root)
+        .env("NOODLE_LAUNCHCTL_BIN", fake_bin.join("launchctl"))
+        .env("NOODLE_UNINSTALL_YES", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("Removed noodle from"), "{combined}");
+    assert!(
+        combined.contains("Removed noodle shell integration"),
+        "{combined}"
+    );
+    assert!(!install_root.exists(), "install root still exists");
+    assert!(
+        !home.join("Library/LaunchAgents/com.noodle.daemon.plist").exists(),
+        "launch agent plist still exists"
+    );
+    let zshrc = fs::read_to_string(home.join(".zshrc")).unwrap();
+    assert!(
+        !zshrc.contains("noodle.plugin.zsh"),
+        "zshrc still contains noodle integration: {zshrc}"
+    );
+    let launchctl_log = fs::read_to_string(&log_path).unwrap();
+    assert!(launchctl_log.contains("bootout"), "{launchctl_log}");
+    assert!(launchctl_log.contains("remove"), "{launchctl_log}");
 }
 
 #[test]
